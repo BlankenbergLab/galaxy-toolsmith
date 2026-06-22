@@ -1,0 +1,10 @@
+You are reviewing a generated Galaxy tool XML wrapper for quality and correctness.
+Return strict JSON with keys:
+- pass: boolean
+- issues: array of strings
+
+Tool name: {{ tool_name }}
+Skills profile: {{ skills_profile }}
+
+Generated XML:
+{{ xml_wrapper }}

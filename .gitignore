@@ -1,0 +1,16 @@
+.gtsm-cache/
+config/gtsm.config.json
+config/dataset.manifest.json
+config/model.manifest.json
+config/training.profiles.json
+config/promotion.policies.json
+.conda-env/
+.conda/
+.conda-pkgs/
+.pip-cache/
+__pycache__/
+*.pyc
+unsloth_compiled_cache/
+*.log
+*.egg-info/
+site/

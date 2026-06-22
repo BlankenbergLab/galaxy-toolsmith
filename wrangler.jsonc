@@ -1,0 +1,14 @@
+{
+  "name": "galaxy-toolsmith-tools-blankenberglab-org",
+  "compatibility_date": "2026-06-10",
+  "assets": {
+    "directory": "./site",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    {
+      "pattern": "galaxy-toolsmith.tools.blankenberglab.org",
+      "custom_domain": true
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 360" role="img" aria-labelledby="title desc">
+  <title id="title">Galaxy Toolsmith command workflow</title>
+  <desc id="desc">Command groups flow from workspace setup to source sync, corpus extraction, training, export, generation, benchmark evaluation, and promotion.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f4ef; }
+      .panel { fill: #ffffff; stroke: #d8cdbd; stroke-width: 2; }
+      .panel-dark { fill: #24323b; stroke: #24323b; stroke-width: 2; }
+      .title { font: 700 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #24323b; }
+      .title-light { font: 700 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .text { font: 500 15px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #3d4a52; }
+      .text-light { font: 500 15px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f6efe6; }
+      .cmd { font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8a5717; }
+      .cmd-light { font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #f8d79a; }
+      .arrow { fill: none; stroke: #8a5717; stroke-width: 3; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="11" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 z" fill="#8a5717"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1180" height="360" rx="0"/>
+  <text class="title" x="38" y="48">Galaxy Toolsmith CLI Workflow</text>
+  <text class="text" x="38" y="78">Most runs move left to right; status JSONL files make long steps monitorable and restartable.</text>
+
+  <rect class="panel" x="38" y="118" width="185" height="150" rx="8"/>
+  <text class="title" x="58" y="152">Setup</text>
+  <text class="cmd" x="58" y="184">doctor</text>
+  <text class="cmd" x="58" y="208">init-workspace</text>
+  <text class="cmd" x="58" y="232">model-cache-info</text>
+
+  <path class="arrow" d="M230 193 H285"/>
+
+  <rect class="panel" x="295" y="118" width="185" height="150" rx="8"/>
+  <text class="title" x="315" y="152">Sources</text>
+  <text class="cmd" x="315" y="184">sync-tools-iuc</text>
+  <text class="cmd" x="315" y="208">sync-galaxy-xsd</text>
+  <text class="cmd" x="315" y="232">extract-corpus</text>
+
+  <path class="arrow" d="M487 193 H542"/>
+
+  <rect class="panel-dark" x="552" y="100" width="220" height="186" rx="8"/>
+  <text class="title-light" x="572" y="136">Train + Export</text>
+  <text class="cmd-light" x="572" y="168">train</text>
+  <text class="text-light" x="572" y="194">DDP, FSDP, ZeRO-3</text>
+  <text class="cmd-light" x="572" y="224">export-model</text>
+  <text class="cmd-light" x="572" y="248">export-ollama-model</text>
+
+  <path class="arrow" d="M779 193 H834"/>
+
+  <rect class="panel" x="844" y="118" width="245" height="150" rx="8"/>
+  <text class="title" x="864" y="152">Generate + Verify</text>
+  <text class="cmd" x="864" y="184">generate-wrapper</text>
+  <text class="cmd" x="864" y="208">benchmark-generate</text>
+  <text class="cmd" x="864" y="232">evaluate-wrappers</text>
+
+  <path class="arrow" d="M663 293 V322 H966 V278"/>
+  <text class="cmd" x="706" y="346">benchmark-summary -> promote-candidate</text>
+</svg>

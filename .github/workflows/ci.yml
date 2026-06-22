@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup miniforge Python
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-variant: Miniforge3
+          miniforge-version: latest
+          activate-environment: ci
+          python-version: "3.12"
+          auto-activate-base: false
+
+      - name: Install package and dev deps
+        shell: bash -l {0}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install build
+
+      - name: Lint (error/fatal checks)
+        shell: bash -l {0}
+        run: |
+          ruff check src/galaxy_toolsmith tests --select E4,E7,E9,F
+
+      - name: Type check (prompt/datatype modules)
+        shell: bash -l {0}
+        run: |
+          mypy src/galaxy_toolsmith/prompts src/galaxy_toolsmith/inference/datatypes.py
+
+      - name: Unit tests
+        shell: bash -l {0}
+        run: |
+          pytest -q tests/unit
+
+      - name: Build package
+        shell: bash -l {0}
+        run: |
+          python -m build
+
+      - name: Smoke test built wheel
+        shell: bash -l {0}
+        run: |
+          python -m venv /tmp/gtsm-wheel-smoke
+          /tmp/gtsm-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/gtsm-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/gtsm-wheel-smoke/bin/gtsm --help
+
+  docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build docs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r docs/requirements.txt
+          python -m mkdocs build --strict
