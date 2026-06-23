@@ -48,7 +48,10 @@ Docker images, and use Bioconda or conda-forge source recipes to find likely
 command entry points and upstream source checkouts.
 
 The enriched corpus is the foundation for both supervised tuning and benchmark
-sampling. In the observed A100 run, the corpus contained 1,985 records, all
+sampling. For UDT-focused runs, extraction can synthesize schema-valid Galaxy
+User-Defined Tool YAML targets from expanded XML wrappers so `udt-yaml` and
+`mixed` training do not depend on native UDT files being present in the source
+repository. In the observed A100 run, the corpus contained 1,985 records, all
 trainable, with 643 records enriched by container help output. XML targets came
 from 197 expanded wrapper records and 1,788 original wrapper targets.
 

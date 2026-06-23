@@ -203,6 +203,7 @@ gtsm extract-corpus \
   --container-cache-dir .gtsm-cache/containers \
   --container-help-probe-mode exploratory \
   --bioconda-checkout-sources \
+  --synthesize-udt-yaml \
   --status-log .gtsm-cache/logs/extract-corpus.status.jsonl
 ```
 
@@ -230,6 +231,7 @@ gtsm extract-corpus \
 | `--no-remove-images` | Keep pulled images after execution instead of removing final-use images. |
 | `--bioconda-checkout-sources` | Resolve conda recipes and checkout/download upstream package source. Starts with Bioconda recipes and can use conda-forge feedstocks when Bioconda is missing or unusable. |
 | `--bioconda-ref <git-ref>` | Bioconda recipes ref for recipe/source resolution. Defaults to `master`. |
+| `--synthesize-udt-yaml` | Write deterministic Galaxy User-Defined Tool YAML targets for each XML wrapper. This enables `udt-yaml` and `mixed` training when a repository does not ship native UDT files. |
 
 Container execution records every attempted candidate, selected runtime, command
 probe, return code, and help classification. Singularity/Apptainer is preferred
@@ -247,6 +249,12 @@ which is the same macro machinery Planemo relies on internally. If Galaxy's
 loader cannot parse a wrapper, extraction falls back to a lightweight local
 expander so malformed or unusual wrappers still produce diagnostics instead of
 stopping the entire corpus run.
+
+When `--synthesize-udt-yaml` is enabled, extraction emits schema-valid UDT YAML
+targets under the corpus dataset directory and records `udt_yaml_path` on each
+wrapper record. The synthesized targets preserve the expanded wrapper command,
+inputs, outputs, selected container, and help text where those fields map
+directly from Galaxy XML.
 
 ### `rebuild-execution-report`
 

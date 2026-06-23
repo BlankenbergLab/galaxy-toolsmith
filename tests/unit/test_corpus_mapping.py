@@ -13,6 +13,7 @@ from galaxy_toolsmith.data.corpus import (
     rebuild_execution_report_from_jsonl,
     write_corpus_diagnostics,
 )
+from galaxy_toolsmith.inference.udt import validate_udt_yaml
 
 
 def test_extract_corpus_includes_shed_suite_and_mapping_fields(tmp_path: Path) -> None:
@@ -161,6 +162,60 @@ def test_extract_corpus_uses_galaxy_macro_expansion_for_requirements(tmp_path: P
     assert rec["requirement_versions"] == {"r-ampvis2": "2.8.11", "r-readr": "2.1.5"}
     assert "r-ampvis2" in expanded_xml
     assert 'macro="header"' not in expanded_xml
+
+
+def test_extract_corpus_synthesizes_schema_valid_udt_yaml(tmp_path: Path) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "samtools"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: samtools\nowner: iuc\n", encoding="utf-8")
+    (tool_dir / "view.xml").write_text(
+        """
+<tool id="samtools_view" name="samtools view" version="1.20">
+  <requirements>
+    <container type="docker">quay.io/biocontainers/samtools:1.20--h50ea8bc_1</container>
+  </requirements>
+  <command><![CDATA[samtools view '$input' > '$output']]></command>
+  <inputs>
+    <param name="input" type="data" format="bam" label="Input BAM"/>
+    <param name="threads" type="integer" value="1" min="1"/>
+  </inputs>
+  <outputs>
+    <data name="output" format="sam"/>
+  </outputs>
+  <help><![CDATA[Convert BAM to SAM.]]></help>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(
+            max_workers=1,
+            retries=1,
+            fetch_documentation=False,
+            synthesize_udt_yaml=True,
+        ),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    udt_path = Path(record["udt_yaml_path"])
+    assert udt_path.exists()
+    assert record["udt_yaml_files"] == ["udt/samtools/view.udt.yml"]
+    udt_text = udt_path.read_text(encoding="utf-8")
+    report = validate_udt_yaml(udt_text, check_conversion=True)
+    assert report.artifact_valid is True, report.notes
+    assert report.conversion_supported is True, report.notes
+    assert "samtools view" in udt_text
+    assert "quay.io/biocontainers/samtools:1.20--h50ea8bc_1" in udt_text
+    assert "$(inputs.input.path)" in udt_text
+    assert "$(outputs.output.path)" in udt_text
+    assert "$input" not in udt_text
 
 
 def test_extract_corpus_writes_container_enriched_help_before_checkpoint(

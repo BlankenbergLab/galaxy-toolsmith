@@ -351,6 +351,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="master",
         help="Bioconda recipes git ref for recipe/source resolution.",
     )
+    extract_parser.add_argument(
+        "--synthesize-udt-yaml",
+        action="store_true",
+        help="Write deterministic Galaxy User-Defined Tool YAML targets for each extracted XML wrapper.",
+    )
 
     rebuild_report_parser = subparsers.add_parser(
         "rebuild-execution-report",
@@ -1805,6 +1810,7 @@ def main() -> int:
                 "fetch_documentation": not args.no_fetch_docs,
                 "resolve_containers": args.resolve_containers,
                 "execute_containers": args.execute_containers,
+                "synthesize_udt_yaml": args.synthesize_udt_yaml,
                 "restart": args.restart,
             },
             outputs={"output": str(output_jsonl), "checkpoint": str(checkpoint_file)},
@@ -1826,6 +1832,7 @@ def main() -> int:
             remove_images_after_use=not args.no_remove_images,
             bioconda_checkout_sources=args.bioconda_checkout_sources,
             bioconda_ref=args.bioconda_ref,
+            synthesize_udt_yaml=args.synthesize_udt_yaml,
             cache_root=paths.source_cache,
             restart=args.restart,
             status_log_path=status_log_path,

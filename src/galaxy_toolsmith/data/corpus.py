@@ -20,11 +20,11 @@ from urllib import request as urlrequest
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
-import requests
-import yaml
-from jinja2 import Environment, StrictUndefined, TemplateError
 from galaxy.tool_util.loader import load_tool_with_refereces
 from galaxy.util import xml_to_string
+from jinja2 import Environment, StrictUndefined, TemplateError
+import requests
+import yaml
 
 from galaxy_toolsmith.inference.datatypes import known_galaxy_datatypes
 from galaxy_toolsmith.runtime.status import emit_status
@@ -50,6 +50,7 @@ class ExtractionSettings:
     container_pull_timeout_seconds: int = 300
     bioconda_checkout_sources: bool = False
     bioconda_ref: str = "master"
+    synthesize_udt_yaml: bool = False
     cache_root: Path | None = None
     restart: bool = False
     status_log_path: Path | None = None
@@ -127,6 +128,8 @@ _CONDA_FORGE_FEEDSTOCK_CACHE_LOCK = threading.Lock()
 _JINJA_ENV = Environment(undefined=StrictUndefined, autoescape=False)
 _RECIPE_SET_RE = re.compile(r"{%\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*%}")
 _UNRESOLVED_TEMPLATE_RE = re.compile(r"({{.*?}}|{%.*?%}|{#.*?#})")
+_XML_BRACED_REF_RE = re.compile(r"(?<![$\\])\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_XML_SIMPLE_REF_RE = re.compile(r"(?<![$\\])\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_.])")
 
 
 @dataclass(frozen=True)
@@ -331,6 +334,302 @@ def _extract_requirements(root: ET.Element) -> tuple[list[str], dict[str, str], 
         if text:
             containers.add(text)
     return sorted(packages), versions, sorted(containers)
+
+
+def _bool_attr(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    cleaned = value.strip().lower()
+    if cleaned in {"true", "yes", "1"}:
+        return True
+    if cleaned in {"false", "no", "0"}:
+        return False
+    return default
+
+
+def _parse_int_attr(value: str | None) -> int | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
+
+
+def _parse_float_attr(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return float(value.strip())
+    except ValueError:
+        return None
+
+
+def _udt_identifier(value: str, fallback: str) -> str:
+    cleaned = _safe_slug(value or fallback).lower().replace(".", "_")
+    if len(cleaned) < 3:
+        cleaned = f"tool_{cleaned or 'generated'}"
+    return cleaned[:255]
+
+
+def _udt_name(value: str | None, fallback: str) -> str:
+    cleaned = _strip_text(value)
+    if cleaned:
+        return cleaned
+    return _udt_identifier(fallback, "parameter")
+
+
+def _udt_extensions(value: str | None) -> list[str]:
+    parts = [part.strip() for part in (value or "").replace(";", ",").split(",")]
+    extensions = [part for part in parts if part]
+    return extensions or ["data"]
+
+
+def _dedupe_named_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    seen: dict[str, int] = {}
+    deduped: list[dict[str, object]] = []
+    for item in items:
+        raw_name = str(item.get("name", "") or "parameter")
+        name = _udt_identifier(raw_name, "parameter")
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        if count:
+            name = f"{name}_{count + 1}"
+        item = dict(item)
+        item["name"] = name
+        deduped.append(item)
+    return deduped
+
+
+def _udt_ref_source_name(element: ET.Element) -> str:
+    return _strip_text(element.attrib.get("name") or element.attrib.get("argument"))
+
+
+def _synthesize_udt_input(param: ET.Element) -> dict[str, object]:
+    param_type = _strip_text(param.attrib.get("type")) or "text"
+    name = _udt_name(param.attrib.get("name") or param.attrib.get("argument"), "parameter")
+    supported_type = {
+        "boolean",
+        "color",
+        "data",
+        "data_collection",
+        "float",
+        "integer",
+        "select",
+        "text",
+    }
+    item: dict[str, object] = {
+        "name": name,
+        "type": param_type if param_type in supported_type else "text",
+    }
+    label = _strip_text(param.attrib.get("label"))
+    help_text = _strip_text(param.attrib.get("help"))
+    argument = _strip_text(param.attrib.get("argument"))
+    if label:
+        item["label"] = label
+    if help_text:
+        item["help"] = help_text
+    if argument:
+        item["argument"] = argument
+    item["optional"] = _bool_attr(param.attrib.get("optional"), default=False)
+
+    input_type = str(item["type"])
+    if input_type == "data":
+        item["extensions"] = _udt_extensions(
+            param.attrib.get("format") or param.attrib.get("ext")
+        )
+        item["multiple"] = _bool_attr(param.attrib.get("multiple"), default=False)
+    elif input_type == "data_collection":
+        item["extensions"] = _udt_extensions(
+            param.attrib.get("format") or param.attrib.get("ext")
+        )
+        item["collection_type"] = _strip_text(param.attrib.get("collection_type")) or "list"
+        item["value"] = {}
+    elif input_type == "boolean":
+        item["value"] = _bool_attr(
+            param.attrib.get("checked") or param.attrib.get("value"), default=False
+        )
+        true_value = _strip_text(param.attrib.get("truevalue"))
+        false_value = _strip_text(param.attrib.get("falsevalue"))
+        if true_value:
+            item["truevalue"] = true_value
+        if false_value:
+            item["falsevalue"] = false_value
+    elif input_type == "integer":
+        for key in ("value", "min", "max"):
+            parsed = _parse_int_attr(param.attrib.get(key))
+            if parsed is not None:
+                item[key] = parsed
+    elif input_type == "float":
+        for key in ("value", "min", "max"):
+            parsed = _parse_float_attr(param.attrib.get(key))
+            if parsed is not None:
+                item[key] = parsed
+    elif input_type == "select":
+        options = []
+        for option in param.findall(".//option"):
+            value = _strip_text(option.attrib.get("value")) or _strip_text(option.text)
+            option_label = _strip_text(option.text) or value
+            if value:
+                options.append({"label": option_label, "value": value})
+        if options:
+            item["options"] = options
+        item["multiple"] = _bool_attr(param.attrib.get("multiple"), default=False)
+    elif input_type == "color":
+        value = _strip_text(param.attrib.get("value"))
+        if value:
+            item["value"] = value
+    elif input_type == "text":
+        value = _strip_text(param.attrib.get("value"))
+        if value:
+            item["value"] = value
+        item["area"] = _bool_attr(param.attrib.get("area"), default=False)
+    return item
+
+
+def _udt_ref_expression(kind: str, name: str, value_type: str) -> str:
+    path_suffix = ".path" if kind == "outputs" or value_type in {"data", "data_collection"} else ""
+    return f"$({kind}.{name}{path_suffix})"
+
+
+def _synthesize_udt_inputs_and_refs(
+    root: ET.Element,
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    params = root.findall(".//inputs//param")
+    source_names = [_udt_ref_source_name(param) for param in params]
+    inputs = _dedupe_named_items([_synthesize_udt_input(param) for param in params])
+    refs: dict[str, str] = {}
+    for source_name, item in zip(source_names, inputs, strict=False):
+        name = str(item.get("name", "") or "")
+        if not name:
+            continue
+        expression = _udt_ref_expression("inputs", name, str(item.get("type", "") or ""))
+        refs[name] = expression
+        if source_name:
+            refs[source_name] = expression
+    return inputs, refs
+
+
+def _synthesize_udt_inputs(root: ET.Element) -> list[dict[str, object]]:
+    inputs, _refs = _synthesize_udt_inputs_and_refs(root)
+    return inputs
+
+
+def _synthesize_udt_outputs_and_refs(
+    root: ET.Element,
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    outputs: list[dict[str, object]] = []
+    source_names: list[str] = []
+    for data in root.findall(".//outputs//data"):
+        item: dict[str, object] = {
+            "name": _udt_name(data.attrib.get("name"), "output"),
+            "type": "data",
+        }
+        label = _strip_text(data.attrib.get("label"))
+        if label:
+            item["label"] = label
+        fmt = _strip_text(data.attrib.get("format") or data.attrib.get("ext"))
+        if fmt:
+            item["format"] = fmt
+        from_work_dir = _strip_text(data.attrib.get("from_work_dir"))
+        if from_work_dir:
+            item["from_work_dir"] = from_work_dir
+        item["hidden"] = _bool_attr(data.attrib.get("hidden"), default=False)
+        outputs.append(item)
+        source_names.append(_udt_ref_source_name(data))
+    for collection in root.findall(".//outputs//collection"):
+        collection_type = _strip_text(collection.attrib.get("type")) or _strip_text(
+            collection.attrib.get("collection_type")
+        )
+        outputs.append(
+            {
+                "name": _udt_name(collection.attrib.get("name"), "collection"),
+                "type": "collection",
+                "hidden": _bool_attr(collection.attrib.get("hidden"), default=False),
+                "structure": {"collection_type": collection_type or "list"},
+            }
+        )
+        source_names.append(_udt_ref_source_name(collection))
+    outputs = _dedupe_named_items(outputs)
+    refs: dict[str, str] = {}
+    for source_name, item in zip(source_names, outputs, strict=False):
+        name = str(item.get("name", "") or "")
+        if not name:
+            continue
+        expression = _udt_ref_expression("outputs", name, str(item.get("type", "") or ""))
+        refs[name] = expression
+        if source_name:
+            refs[source_name] = expression
+    return outputs, refs
+
+
+def _synthesize_udt_outputs(root: ET.Element) -> list[dict[str, object]]:
+    outputs, _refs = _synthesize_udt_outputs_and_refs(root)
+    return outputs
+
+
+def _xml_command_to_udt(
+    command_text: str,
+    *,
+    input_refs: dict[str, str],
+    output_refs: dict[str, str],
+) -> str:
+    refs = dict(input_refs)
+    refs.update(output_refs)
+
+    def replace_braced(match: re.Match[str]) -> str:
+        return refs.get(match.group(1), match.group(0))
+
+    def replace_simple(match: re.Match[str]) -> str:
+        return refs.get(match.group(1), match.group(0))
+
+    converted = _XML_BRACED_REF_RE.sub(replace_braced, command_text)
+    converted = _XML_SIMPLE_REF_RE.sub(replace_simple, converted)
+    return converted.strip() or "true"
+
+
+def _synthesize_udt_yaml(
+    *,
+    root: ET.Element,
+    tool_id: str,
+    tool_name: str,
+    command_text: str,
+    help_text: str,
+    selected_container: str,
+    container_refs: list[str],
+    output_path: Path,
+) -> Path:
+    container = selected_container or (container_refs[0] if container_refs else "")
+    version = _strip_text(root.attrib.get("version")) or "0.1.0"
+    if "@" in version or "$" in version:
+        version = "0.1.0"
+    description = _strip_text(root.attrib.get("description"))
+    inputs, input_refs = _synthesize_udt_inputs_and_refs(root)
+    outputs, output_refs = _synthesize_udt_outputs_and_refs(root)
+    payload: dict[str, object] = {
+        "class": "GalaxyUserTool",
+        "id": _udt_identifier(tool_id, output_path.stem),
+        "version": version,
+        "name": tool_name or _udt_identifier(tool_id, output_path.stem),
+        "container": container,
+        "shell_command": _xml_command_to_udt(
+            command_text,
+            input_refs=input_refs,
+            output_refs=output_refs,
+        ),
+        "inputs": inputs,
+        "outputs": outputs,
+    }
+    if description:
+        payload["description"] = description
+    if help_text.strip():
+        payload["help"] = {"format": "markdown", "content": help_text.strip()}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+    return output_path
 
 
 def _merge_requirement_sets(
@@ -3761,6 +4060,27 @@ def _extract_one_wrapper(
         )
     udt_yaml_files = _user_defined_tool_yaml_files(tool_dir)
     udt_yaml_path = str(tool_dir / udt_yaml_files[0]) if udt_yaml_files else ""
+    if settings.synthesize_udt_yaml:
+        rel_tool_dir = tool_dir.relative_to(tools_root)
+        udt_output_path = (
+            expanded_root.parent
+            / "udt"
+            / rel_tool_dir
+            / f"{_safe_slug(xml_file.stem) or 'tool'}.udt.yml"
+        )
+        udt_yaml_path = str(
+            _synthesize_udt_yaml(
+                root=metadata_root,
+                tool_id=tool_id,
+                tool_name=tool_name,
+                command_text=command_text,
+                help_text=help_text,
+                selected_container=selected_container,
+                container_refs=container_refs,
+                output_path=udt_output_path,
+            )
+        )
+        udt_yaml_files = [str(Path(udt_yaml_path).relative_to(expanded_root.parent))]
 
     return ToolRecord(
         package_id=package_id,
@@ -3906,6 +4226,10 @@ def _archive_extract_outputs(
     if expanded_root.exists():
         shutil.move(str(expanded_root), str(archive_dir / "expanded"))
         archived.append(str(expanded_root))
+    udt_root = output_jsonl.parent / "udt"
+    if udt_root.exists():
+        shutil.move(str(udt_root), str(archive_dir / "udt"))
+        archived.append(str(udt_root))
 
     if not archived:
         shutil.rmtree(archive_dir)
@@ -3955,6 +4279,13 @@ def _snapshot_completed_run(
             shutil.rmtree(run_expanded)
         shutil.copytree(expanded_root, run_expanded)
         copied.append("expanded")
+    udt_root = output_jsonl.parent / "udt"
+    if udt_root.exists():
+        run_udt = run_dir / "udt"
+        if run_udt.exists():
+            shutil.rmtree(run_udt)
+        shutil.copytree(udt_root, run_udt)
+        copied.append("udt")
     if settings.status_log_path and settings.status_log_path.exists():
         run_status_log = run_dir / settings.status_log_path.name
         if settings.status_log_path.resolve() != run_status_log.resolve():
