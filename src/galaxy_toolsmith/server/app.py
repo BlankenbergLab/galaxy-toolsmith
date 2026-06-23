@@ -6,6 +6,7 @@ import os
 import socket
 from pathlib import Path
 
+from galaxy_toolsmith import __version__
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.artifacts import format_cli_value, normalize_artifact_format
 from galaxy_toolsmith.inference.generation import generate_xml_from_content
@@ -59,7 +60,7 @@ def create_app(
             "FastAPI server requires optional server deps. Install with: pip install -e '.[server]'"
         ) from error
 
-    app = FastAPI(title="Galaxy Toolsmith Server", version="0.1.0")
+    app = FastAPI(title="Galaxy Toolsmith Server", version=__version__)
     paths = WorkspacePaths.from_repo_root(repo_root)
     paths.create_directories()
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
 
 from galaxy_toolsmith.data.corpus import (
+    _CONFIGFILE_TRUNCATION_MARKER,
     ContainerPreparation,
     ContainerRuntime,
     ExtractionSettings,
@@ -176,6 +178,11 @@ def test_extract_corpus_synthesizes_schema_valid_udt_yaml(tmp_path: Path) -> Non
     <container type="docker">quay.io/biocontainers/samtools:1.20--h50ea8bc_1</container>
   </requirements>
   <command><![CDATA[samtools view '$input' > '$output']]></command>
+  <configfiles>
+    <configfile name="settings" filename="settings.json"><![CDATA[
+{"threads": "$threads"}
+    ]]></configfile>
+  </configfiles>
   <inputs>
     <param name="input" type="data" format="bam" label="Input BAM"/>
     <param name="threads" type="integer" value="1" min="1"/>
@@ -213,9 +220,185 @@ def test_extract_corpus_synthesizes_schema_valid_udt_yaml(tmp_path: Path) -> Non
     assert report.conversion_supported is True, report.notes
     assert "samtools view" in udt_text
     assert "quay.io/biocontainers/samtools:1.20--h50ea8bc_1" in udt_text
+    assert "configfiles:" in udt_text
+    assert "settings.json" in udt_text
+    assert "threads" in udt_text
     assert "$(inputs.input.path)" in udt_text
     assert "$(outputs.output.path)" in udt_text
     assert "$input" not in udt_text
+
+
+def test_extract_corpus_records_wrapper_helper_scripts_and_configfiles(tmp_path: Path) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "helper_tool"
+    (tool_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: helper_tool\nowner: iuc\n", encoding="utf-8")
+    (tool_dir / "helper.py").write_text("print('python helper')\n", encoding="utf-8")
+    (tool_dir / "plot.R").write_text("print('r helper')\n", encoding="utf-8")
+    (tool_dir / "scripts" / "run.sh").write_text("echo shell helper\n", encoding="utf-8")
+    (tool_dir / "helper.xml").write_text(
+        """
+<tool id="helper_tool" name="Helper Tool" version="1.0">
+  <command><![CDATA[
+python '$__tool_directory__/helper.py' &&
+Rscript plot.R &&
+bash scripts/run.sh &&
+python '$script'
+  ]]></command>
+  <configfiles>
+    <configfile name="script" filename="generated.py" foo="bar"><![CDATA[
+print("config helper")
+    ]]></configfile>
+    <configfile name="settings" filename="settings.json"><![CDATA[
+{"mode": "fast"}
+    ]]></configfile>
+    <configfile name="xml_template" filename="template.xml">
+prefix <section attr="one"><item>$input</item></section> suffix
+    </configfile>
+  </configfiles>
+  <outputs>
+    <data name="output" format="txt"/>
+  </outputs>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(max_workers=1, retries=1, fetch_documentation=False),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    helper_paths = {item["relative_path"] for item in record["wrapper_helper_files"]}
+    assert helper_paths == {"helper.py", "plot.R", "scripts/run.sh"}
+    assert record["wrapper_source_summary"]["helper_file_count"] == 3
+    assert record["wrapper_source_summary"]["configfile_count"] == 3
+    assert record["wrapper_source_summary"]["truncated_configfile_count"] == 0
+    configfiles = {item["name"]: item for item in record["wrapper_configfiles"]}
+    script_config = configfiles["script"]
+    assert script_config["filename"] == "generated.py"
+    assert script_config["attributes"]["foo"] == "bar"
+    assert script_config["template_kind"] == "script_template"
+    assert script_config["language"] == "python"
+    assert script_config["referenced_by_command"] is True
+    assert "config helper" in script_config["content"]
+    settings_config = configfiles["settings"]
+    assert settings_config["template_kind"] == "config_template"
+    assert settings_config["language"] == "json"
+    assert settings_config["referenced_by_command"] is False
+    xml_config = configfiles["xml_template"]
+    assert xml_config["template_kind"] == "config_template"
+    assert "<section attr=\"one\"><item>$input</item></section>" in xml_config["content"]
+    assert "prefix" in xml_config["content"]
+    assert "suffix" in xml_config["content"]
+    assert xml_config["byte_count"] == xml_config["stored_byte_count"]
+    assert xml_config["content_truncated"] is False
+
+
+def test_extract_corpus_truncates_large_configfiles_and_omits_from_udt(
+    tmp_path: Path,
+) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "large_config_tool"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: large_config_tool\nowner: iuc\n", encoding="utf-8")
+    configfile_max_bytes = 512
+    large_content = "x" * (configfile_max_bytes + 1024)
+    (tool_dir / "large.xml").write_text(
+        f"""
+<tool id="large_config_tool" name="Large Config Tool" version="1.0">
+  <command><![CDATA[cat '$input' > '$output']]></command>
+  <configfiles>
+    <configfile name="large" filename="large.txt"><![CDATA[
+{large_content}
+    ]]></configfile>
+  </configfiles>
+  <inputs>
+    <param name="input" type="data" format="txt"/>
+  </inputs>
+  <outputs>
+    <data name="output" format="txt"/>
+  </outputs>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(
+            max_workers=1,
+            retries=1,
+            fetch_documentation=False,
+            synthesize_udt_yaml=True,
+            wrapper_configfile_max_bytes=configfile_max_bytes,
+        ),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    configfile = record["wrapper_configfiles"][0]
+    full_content = f"{large_content}\n    "
+    full_bytes = full_content.encode("utf-8", errors="replace")
+    assert configfile["byte_count"] == len(full_bytes)
+    assert configfile["stored_byte_count"] <= configfile_max_bytes
+    assert configfile["sha256"] == hashlib.sha256(full_bytes).hexdigest()
+    assert configfile["content_truncated"] is True
+    assert configfile["content"].endswith(_CONFIGFILE_TRUNCATION_MARKER)
+    assert record["wrapper_source_summary"]["truncated_configfile_count"] == 1
+
+    udt_text = Path(record["udt_yaml_path"]).read_text(encoding="utf-8")
+    assert "configfiles:" not in udt_text
+    assert "large.txt" not in udt_text
+
+
+def test_extract_corpus_rejects_unsafe_or_nontext_wrapper_helpers(tmp_path: Path) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "unsafe_tool"
+    (tool_dir / "test-data").mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: unsafe_tool\nowner: iuc\n", encoding="utf-8")
+    (tools_root / "outside.py").write_text("print('outside')\n", encoding="utf-8")
+    (tool_dir / "test-data" / "skip.py").write_text("print('skip')\n", encoding="utf-8")
+    (tool_dir / "large.py").write_text("x = 1\n" * 50_000, encoding="utf-8")
+    (tool_dir / "binary.py").write_bytes(b"print('binary')\x00\n")
+    (tool_dir / "unsafe.xml").write_text(
+        """
+<tool id="unsafe_tool" name="Unsafe Tool" version="1.0">
+  <command><![CDATA[
+python '$__tool_directory__/../outside.py' &&
+python '$__tool_directory__/test-data/skip.py' &&
+python '$__tool_directory__/large.py' &&
+python '$__tool_directory__/binary.py'
+  ]]></command>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(max_workers=1, retries=1, fetch_documentation=False),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    assert record["wrapper_helper_files"] == []
+    skip_reasons = record["wrapper_source_summary"]["skip_reasons"]
+    assert skip_reasons["outside_tool_dir"] == 1
+    assert skip_reasons["test_data"] == 1
+    assert skip_reasons["too_large"] == 1
+    assert skip_reasons["binary_content"] == 1
 
 
 def test_extract_corpus_writes_container_enriched_help_before_checkpoint(

@@ -25,6 +25,8 @@ from galaxy_toolsmith.core.config import write_default_config
 from galaxy_toolsmith.core.manifests import DatasetManifest, ModelVariantManifest, SourceRef
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.data.corpus import (
+    DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES,
+    DEFAULT_WRAPPER_SOURCE_MAX_BYTES,
     ExtractionSettings,
     extract_tools_corpus,
     rebuild_execution_report_from_jsonl,
@@ -355,6 +357,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--synthesize-udt-yaml",
         action="store_true",
         help="Write deterministic Galaxy User-Defined Tool YAML targets for each extracted XML wrapper.",
+    )
+    extract_parser.add_argument(
+        "--wrapper-source-max-bytes",
+        type=int,
+        default=DEFAULT_WRAPPER_SOURCE_MAX_BYTES,
+        help=(
+            "Maximum bytes for wrapper-local helper source files captured as context "
+            f"(default: {DEFAULT_WRAPPER_SOURCE_MAX_BYTES})."
+        ),
+    )
+    extract_parser.add_argument(
+        "--wrapper-configfile-max-bytes",
+        type=int,
+        default=DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES,
+        help=(
+            "Maximum stored bytes for each inline wrapper configfile context block "
+            f"(default: {DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES})."
+        ),
     )
 
     rebuild_report_parser = subparsers.add_parser(
@@ -1811,6 +1831,8 @@ def main() -> int:
                 "resolve_containers": args.resolve_containers,
                 "execute_containers": args.execute_containers,
                 "synthesize_udt_yaml": args.synthesize_udt_yaml,
+                "wrapper_source_max_bytes": args.wrapper_source_max_bytes,
+                "wrapper_configfile_max_bytes": args.wrapper_configfile_max_bytes,
                 "restart": args.restart,
             },
             outputs={"output": str(output_jsonl), "checkpoint": str(checkpoint_file)},
@@ -1833,6 +1855,8 @@ def main() -> int:
             bioconda_checkout_sources=args.bioconda_checkout_sources,
             bioconda_ref=args.bioconda_ref,
             synthesize_udt_yaml=args.synthesize_udt_yaml,
+            wrapper_source_max_bytes=args.wrapper_source_max_bytes,
+            wrapper_configfile_max_bytes=args.wrapper_configfile_max_bytes,
             cache_root=paths.source_cache,
             restart=args.restart,
             status_log_path=status_log_path,

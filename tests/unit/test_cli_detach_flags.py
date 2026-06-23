@@ -221,6 +221,10 @@ def test_extract_corpus_container_flags_parse() -> None:
             "/tmp/extract.status.jsonl",
             "--docker-use-sudo",
             "--bioconda-checkout-sources",
+            "--wrapper-source-max-bytes",
+            "1234",
+            "--wrapper-configfile-max-bytes",
+            "5678",
             "--restart",
         ]
     )
@@ -233,4 +237,6 @@ def test_extract_corpus_container_flags_parse() -> None:
     assert args.status_log == "/tmp/extract.status.jsonl"
     assert args.docker_use_sudo is True
     assert args.bioconda_checkout_sources is True
+    assert args.wrapper_source_max_bytes == 1234
+    assert args.wrapper_configfile_max_bytes == 5678
     assert args.restart is True

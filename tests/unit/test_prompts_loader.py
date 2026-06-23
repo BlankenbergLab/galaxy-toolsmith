@@ -39,6 +39,10 @@ def test_default_xml_generate_prompt_renders_required_fields() -> None:
     assert "preserve required/core options" in rendered
     assert "Choose output datatypes deliberately" in rendered
     assert "html only for actual HTML" in rendered
+    assert "Do not create or reference external helper files" in rendered
+    assert "behavior context to understand the command line" in rendered
+    assert "Prefer direct <command> logic" in rendered
+    assert "script-like configfiles only as a last resort" in rendered
 
 
 def test_default_udt_yaml_generate_prompt_renders_required_fields() -> None:
@@ -60,6 +64,9 @@ def test_default_udt_yaml_generate_prompt_renders_required_fields() -> None:
     assert "Interface hints:" in rendered
     assert "Use only supported UDT input types" in rendered
     assert "Do not include unsupported Galaxy XML concepts" in rendered
+    assert "Do not create or reference external helper files" in rendered
+    assert "behavior context to understand the command line" in rendered
+    assert "script-like configfiles only as a last resort" in rendered
 
 
 def test_prompt_loader_falls_back_to_default_profile() -> None:

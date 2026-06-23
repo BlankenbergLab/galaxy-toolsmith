@@ -51,7 +51,16 @@ The enriched corpus is the foundation for both supervised tuning and benchmark
 sampling. For UDT-focused runs, extraction can synthesize schema-valid Galaxy
 User-Defined Tool YAML targets from expanded XML wrappers so `udt-yaml` and
 `mixed` training do not depend on native UDT files being present in the source
-repository. In the observed A100 run, the corpus contained 1,985 records, all
+repository. The synthesized UDTs preserve directly mappable commands, inputs,
+outputs, containers, help, and inline configfiles. Extraction also records
+wrapper-local helper scripts and inline configfile templates so prompt source
+context can include code that Galaxy wrappers generate or call from the tool
+directory. Those capture byte limits are configurable during extraction, and
+oversized configfiles are bounded in context instead of bloating corpus records.
+Generation prompts treat those files as context for understanding existing
+wrappers, while still preferring self-contained outputs over newly invented
+external helper scripts.
+In the observed A100 run, the corpus contained 1,985 records, all
 trainable, with 643 records enriched by container help output. XML targets came
 from 197 expanded wrapper records and 1,788 original wrapper targets.
 

@@ -20,14 +20,17 @@ from urllib import request as urlrequest
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
+import requests
+import yaml
 from galaxy.tool_util.loader import load_tool_with_refereces
 from galaxy.util import xml_to_string
 from jinja2 import Environment, StrictUndefined, TemplateError
-import requests
-import yaml
 
 from galaxy_toolsmith.inference.datatypes import known_galaxy_datatypes
 from galaxy_toolsmith.runtime.status import emit_status
+
+DEFAULT_WRAPPER_SOURCE_MAX_BYTES = 256_000
+DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES = 256_000
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class ExtractionSettings:
     bioconda_checkout_sources: bool = False
     bioconda_ref: str = "master"
     synthesize_udt_yaml: bool = False
+    wrapper_source_max_bytes: int = DEFAULT_WRAPPER_SOURCE_MAX_BYTES
+    wrapper_configfile_max_bytes: int = DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES
     cache_root: Path | None = None
     restart: bool = False
     status_log_path: Path | None = None
@@ -61,7 +66,7 @@ class ExtractionSettings:
 @dataclass
 class ToolRecord:
     # identity
-    schema_version: str = "0.4.0"
+    schema_version: str = "0.5.0"
     package_id: str = ""
     tool_name: str = ""
     tool_id: str = ""
@@ -96,6 +101,9 @@ class ToolRecord:
     subcommands: list[str] = field(default_factory=list)
     invocation_patterns: list[str] = field(default_factory=list)
     command_text: str = ""
+    wrapper_helper_files: list[dict] = field(default_factory=list)
+    wrapper_configfiles: list[dict] = field(default_factory=list)
+    wrapper_source_summary: dict = field(default_factory=dict)
 
     # datatype / tests
     input_parameter_types: list[str] = field(default_factory=list)
@@ -130,6 +138,101 @@ _RECIPE_SET_RE = re.compile(r"{%\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*
 _UNRESOLVED_TEMPLATE_RE = re.compile(r"({{.*?}}|{%.*?%}|{#.*?#})")
 _XML_BRACED_REF_RE = re.compile(r"(?<![$\\])\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _XML_SIMPLE_REF_RE = re.compile(r"(?<![$\\])\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_.])")
+_TOOL_DIRECTORY_RE = re.compile(r"\$?\{?__tool_directory__\}?")
+_COMMAND_VARIABLE_RE = re.compile(r"\$+\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+_WRAPPER_SOURCE_MAX_BYTES = DEFAULT_WRAPPER_SOURCE_MAX_BYTES
+_WRAPPER_CONFIGFILE_MAX_BYTES = DEFAULT_WRAPPER_CONFIGFILE_MAX_BYTES
+_CONFIGFILE_TRUNCATION_MARKER = "\n[truncated configfile content]\n"
+_WRAPPER_SOURCE_EXTENSIONS = {
+    ".awk",
+    ".bash",
+    ".c",
+    ".cc",
+    ".cfg",
+    ".cpp",
+    ".cwl",
+    ".go",
+    ".h",
+    ".hpp",
+    ".ini",
+    ".java",
+    ".jl",
+    ".js",
+    ".json",
+    ".lua",
+    ".md",
+    ".nf",
+    ".pl",
+    ".pm",
+    ".py",
+    ".r",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".wdl",
+    ".yaml",
+    ".yml",
+}
+_WRAPPER_SCRIPT_CONFIGFILE_EXTENSIONS = {
+    ".awk",
+    ".bash",
+    ".jl",
+    ".js",
+    ".lua",
+    ".pl",
+    ".pm",
+    ".py",
+    ".r",
+    ".rb",
+    ".sh",
+    ".ts",
+}
+_WRAPPER_CONFIG_TEMPLATE_EXTENSIONS = {
+    ".cfg",
+    ".ini",
+    ".json",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+_WRAPPER_BINARY_OR_DATA_EXTENSIONS = {
+    ".7z",
+    ".a",
+    ".bam",
+    ".bcf",
+    ".bz2",
+    ".cram",
+    ".db",
+    ".dll",
+    ".dylib",
+    ".fa",
+    ".fasta",
+    ".fastq",
+    ".fq",
+    ".gz",
+    ".h5",
+    ".jpg",
+    ".jpeg",
+    ".o",
+    ".pdf",
+    ".png",
+    ".pyc",
+    ".pyd",
+    ".pkl",
+    ".sam",
+    ".so",
+    ".sqlite",
+    ".tar",
+    ".tgz",
+    ".tiff",
+    ".vcf",
+    ".xz",
+    ".zip",
+}
 
 
 @dataclass(frozen=True)
@@ -334,6 +437,305 @@ def _extract_requirements(root: ET.Element) -> tuple[list[str], dict[str, str], 
         if text:
             containers.add(text)
     return sorted(packages), versions, sorted(containers)
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _is_within_directory(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _is_wrapper_test_data_path(relpath: Path) -> bool:
+    return any(part in {"test", "test-data", "test_data", "tests"} for part in relpath.parts)
+
+
+def _wrapper_source_path_skip_reason(path: Path, tool_dir: Path, max_bytes: int) -> str:
+    try:
+        resolved_tool_dir = tool_dir.resolve()
+        resolved = path.resolve(strict=False)
+    except OSError as error:
+        return f"path_error:{error}"
+    if not _is_within_directory(resolved, resolved_tool_dir):
+        return "outside_tool_dir"
+    try:
+        relpath = resolved.relative_to(resolved_tool_dir)
+    except ValueError:
+        return "outside_tool_dir"
+    if _is_wrapper_test_data_path(relpath):
+        return "test_data"
+    if path.is_symlink():
+        return "symlink"
+    if not path.exists():
+        return "missing"
+    if not path.is_file():
+        return "not_file"
+    suffix = path.suffix.lower()
+    if suffix in _WRAPPER_BINARY_OR_DATA_EXTENSIONS:
+        return "binary_or_data"
+    if suffix not in _WRAPPER_SOURCE_EXTENSIONS:
+        return "unsupported_extension"
+    try:
+        stat = path.stat()
+    except OSError as error:
+        return f"stat_error:{error}"
+    if stat.st_size > max(1, max_bytes):
+        return "too_large"
+    try:
+        chunk = path.read_bytes()[:8192]
+    except OSError as error:
+        return f"read_error:{error}"
+    if b"\x00" in chunk:
+        return "binary_content"
+    if chunk:
+        control_count = sum(1 for byte in chunk if byte < 32 and byte not in b"\n\r\t\f\b")
+        if control_count / len(chunk) >= 0.05:
+            return "binary_content"
+    return ""
+
+
+def _helper_candidate_token_values(token: str) -> list[str]:
+    cleaned = _clean_command_token(token).strip(",")
+    if not cleaned:
+        return []
+    values = [cleaned]
+    if "=" in cleaned:
+        option_value = cleaned.split("=", 1)[1].strip()
+        if option_value:
+            values.append(option_value)
+    return values
+
+
+def _helper_candidate_path_from_token(token: str, tool_dir: Path) -> tuple[Path | None, str]:
+    cleaned = _clean_command_token(token).strip(",")
+    if not cleaned:
+        return None, "empty"
+    uses_tool_directory = "__tool_directory__" in cleaned
+    normalized = _TOOL_DIRECTORY_RE.sub(".", cleaned)
+    if "$" in normalized or "{" in normalized or "}" in normalized:
+        return None, "dynamic"
+    if normalized.startswith("-"):
+        return None, "option"
+    if not uses_tool_directory and "/" not in normalized and "\\" not in normalized:
+        suffix = Path(normalized).suffix.lower()
+        if suffix not in _WRAPPER_SOURCE_EXTENSIONS:
+            return None, "not_path"
+    candidate = Path(normalized).expanduser()
+    path = candidate if candidate.is_absolute() else tool_dir / candidate
+    suffix = path.suffix.lower()
+    if suffix not in _WRAPPER_SOURCE_EXTENSIONS:
+        return path, "unsupported_extension"
+    return path, ""
+
+
+def _helper_candidate_paths_from_command(command_text: str, tool_dir: Path) -> tuple[list[Path], dict[str, int]]:
+    candidates: list[Path] = []
+    skipped: dict[str, int] = {}
+    seen: set[str] = set()
+    for raw_line in command_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for segment in _command_segments(line):
+            for token in _command_tokens(segment):
+                for value in _helper_candidate_token_values(token):
+                    path, skip_reason = _helper_candidate_path_from_token(value, tool_dir)
+                    if skip_reason and skip_reason not in {"not_path", "option", "dynamic"}:
+                        skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
+                    if path is None:
+                        continue
+                    key = str(path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(path)
+    return candidates, skipped
+
+
+def _wrapper_helper_record(path: Path, tool_dir: Path) -> dict:
+    text_bytes = path.read_bytes()
+    relpath = path.resolve().relative_to(tool_dir.resolve()).as_posix()
+    return {
+        "path": str(path),
+        "relative_path": relpath,
+        "extension": path.suffix.lower(),
+        "byte_count": len(text_bytes),
+        "sha256": _sha256_bytes(text_bytes),
+        "role_hint": "command_reference",
+    }
+
+
+def _extract_wrapper_helper_files(
+    tool_dir: Path,
+    command_text: str,
+    *,
+    max_bytes: int,
+) -> tuple[list[dict], dict[str, int]]:
+    candidates, skipped = _helper_candidate_paths_from_command(command_text, tool_dir)
+    helpers: list[dict] = []
+    seen: set[str] = set()
+    for path in candidates:
+        skip_reason = _wrapper_source_path_skip_reason(path, tool_dir, max_bytes)
+        if skip_reason:
+            skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        helpers.append(_wrapper_helper_record(path, tool_dir))
+    return helpers, skipped
+
+
+def _configfile_content(configfile: ET.Element) -> str:
+    parts: list[str] = []
+    if configfile.text:
+        parts.append(configfile.text)
+    for child in list(configfile):
+        parts.append(ET.tostring(child, encoding="unicode"))
+    return "".join(parts).strip("\n")
+
+
+def _truncate_text_to_utf8_bytes(text: str, max_bytes: int, marker: str) -> tuple[str, bool]:
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return text, False
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= max_bytes:
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore"), True
+    prefix = raw[: max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix.rstrip("\n") + marker, True
+
+
+def _bounded_configfile_content(
+    content: str,
+    *,
+    max_bytes: int,
+) -> tuple[str, int, int, str, bool]:
+    full_bytes = content.encode("utf-8", errors="replace")
+    stored_content, truncated = _truncate_text_to_utf8_bytes(
+        content,
+        max(1, max_bytes),
+        _CONFIGFILE_TRUNCATION_MARKER,
+    )
+    stored_byte_count = len(stored_content.encode("utf-8", errors="replace"))
+    return stored_content, len(full_bytes), stored_byte_count, _sha256_bytes(full_bytes), truncated
+
+
+def _configfile_extension(name: str, filename: str) -> str:
+    suffix = Path(filename or name).suffix.lower()
+    return suffix
+
+
+def _configfile_language_hint(extension: str) -> str:
+    return {
+        ".awk": "awk",
+        ".bash": "bash",
+        ".cfg": "config",
+        ".ini": "ini",
+        ".jl": "julia",
+        ".js": "javascript",
+        ".json": "json",
+        ".lua": "lua",
+        ".pl": "perl",
+        ".pm": "perl",
+        ".py": "python",
+        ".r": "r",
+        ".rb": "ruby",
+        ".sh": "shell",
+        ".toml": "toml",
+        ".ts": "typescript",
+        ".txt": "text",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+    }.get(extension, "")
+
+
+def _configfile_template_kind(extension: str, content: str) -> str:
+    first_line = content.lstrip().splitlines()[0] if content.strip() else ""
+    if (
+        extension in _WRAPPER_SCRIPT_CONFIGFILE_EXTENSIONS
+        or first_line.startswith("#!")
+        or "argparse" in content
+        or "suppressPackageStartupMessages" in content
+    ):
+        return "script_template"
+    if extension in _WRAPPER_CONFIG_TEMPLATE_EXTENSIONS or content.strip():
+        return "config_template"
+    return "other_template"
+
+
+def _command_reference_names(command_text: str) -> set[str]:
+    names: set[str] = set()
+    for match in _COMMAND_VARIABLE_RE.finditer(command_text):
+        name = match.group(1).strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def _extract_wrapper_configfiles(
+    root: ET.Element,
+    command_text: str,
+    *,
+    max_bytes: int,
+) -> list[dict]:
+    reference_names = _command_reference_names(command_text)
+    configfiles: list[dict] = []
+    for index, configfile in enumerate(root.findall(".//configfiles//configfile"), start=1):
+        attributes = {str(key): str(value) for key, value in sorted(configfile.attrib.items())}
+        name = _strip_text(configfile.attrib.get("name"))
+        filename = _strip_text(configfile.attrib.get("filename"))
+        raw_content = _configfile_content(configfile)
+        content, byte_count, stored_byte_count, sha256, content_truncated = (
+            _bounded_configfile_content(raw_content, max_bytes=max_bytes)
+        )
+        extension = _configfile_extension(name, filename)
+        template_kind = _configfile_template_kind(extension, raw_content)
+        referenced = bool(
+            (name and name in reference_names)
+            or (filename and filename in command_text)
+            or (name and f"${name}" in command_text)
+        )
+        configfiles.append(
+            {
+                "name": name or f"configfile_{index}",
+                "filename": filename,
+                "attributes": attributes,
+                "extension": extension,
+                "language": _configfile_language_hint(extension),
+                "byte_count": byte_count,
+                "stored_byte_count": stored_byte_count,
+                "sha256": sha256,
+                "content_truncated": content_truncated,
+                "template_kind": template_kind,
+                "role_hint": template_kind,
+                "referenced_by_command": referenced,
+                "content": content,
+            }
+        )
+    return configfiles
+
+
+def _wrapper_source_summary(
+    helper_files: list[dict],
+    configfiles: list[dict],
+    skipped: dict[str, int],
+) -> dict:
+    return {
+        "helper_file_count": len(helper_files),
+        "configfile_count": len(configfiles),
+        "truncated_configfile_count": sum(
+            1 for item in configfiles if item.get("content_truncated")
+        ),
+        "skipped_file_count": sum(skipped.values()),
+        "skip_reasons": dict(sorted(skipped.items())),
+    }
 
 
 def _bool_attr(value: str | None, *, default: bool = False) -> bool:
@@ -588,6 +990,34 @@ def _xml_command_to_udt(
     return converted.strip() or "true"
 
 
+def _synthesize_udt_configfiles(
+    root: ET.Element,
+    *,
+    max_bytes: int,
+) -> list[dict[str, object]]:
+    configfiles: list[dict[str, object]] = []
+    for index, configfile in enumerate(root.findall(".//configfiles//configfile"), start=1):
+        content = _configfile_content(configfile)
+        if not content.strip():
+            continue
+        if len(content.encode("utf-8", errors="replace")) > max(1, max_bytes):
+            continue
+        name = _strip_text(configfile.attrib.get("name"))
+        filename = _strip_text(configfile.attrib.get("filename"))
+        item: dict[str, object] = {"content": content}
+        if name:
+            item["name"] = name
+        elif not filename:
+            item["name"] = f"config_{index}"
+        if filename:
+            item["filename"] = filename
+        eval_engine = _strip_text(configfile.attrib.get("eval_engine"))
+        if eval_engine == "ecmascript":
+            item["eval_engine"] = eval_engine
+        configfiles.append(item)
+    return configfiles
+
+
 def _synthesize_udt_yaml(
     *,
     root: ET.Element,
@@ -598,6 +1028,7 @@ def _synthesize_udt_yaml(
     selected_container: str,
     container_refs: list[str],
     output_path: Path,
+    wrapper_configfile_max_bytes: int,
 ) -> Path:
     container = selected_container or (container_refs[0] if container_refs else "")
     version = _strip_text(root.attrib.get("version")) or "0.1.0"
@@ -622,6 +1053,12 @@ def _synthesize_udt_yaml(
     }
     if description:
         payload["description"] = description
+    configfiles = _synthesize_udt_configfiles(
+        root,
+        max_bytes=wrapper_configfile_max_bytes,
+    )
+    if configfiles:
+        payload["configfiles"] = configfiles
     if help_text.strip():
         payload["help"] = {"format": "markdown", "content": help_text.strip()}
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2670,13 +3107,14 @@ def _download_and_extract_archive(source_url: str, checkout_dir: Path) -> str:
     if tmp_path.exists():
         tmp_path.unlink()
     if parsed.scheme.lower() == "ftp":
-        with tmp_path.open("wb") as handle:
-            with urlrequest.urlopen(source_url, timeout=120) as response:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
+        with tmp_path.open("wb") as handle, urlrequest.urlopen(
+            source_url, timeout=120
+        ) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
     else:
         with requests.get(source_url, timeout=120, stream=True) as response:
             response.raise_for_status()
@@ -3212,9 +3650,7 @@ def _should_use_conda_forge_fallback(primary: dict, fallback: dict) -> bool:
         return True
     if not primary.get("recipe_path") and fallback.get("recipe_path"):
         return True
-    if not primary.get("source_url") and fallback.get("source_url"):
-        return True
-    return False
+    return bool(not primary.get("source_url") and fallback.get("source_url"))
 
 
 def _annotate_conda_forge_fallback(fallback: dict, primary: dict) -> dict:
@@ -4012,6 +4448,21 @@ def _extract_one_wrapper(
         _strip_text(node.text) for node in command_nodes if _strip_text(node.text)
     )
     primary_command, subcommands, invocation_patterns = _infer_command_signatures(command_text)
+    wrapper_helper_files, wrapper_helper_skipped = _extract_wrapper_helper_files(
+        tool_dir,
+        command_text,
+        max_bytes=settings.wrapper_source_max_bytes,
+    )
+    wrapper_configfiles = _extract_wrapper_configfiles(
+        metadata_root,
+        command_text,
+        max_bytes=settings.wrapper_configfile_max_bytes,
+    )
+    wrapper_source_summary = _wrapper_source_summary(
+        wrapper_helper_files,
+        wrapper_configfiles,
+        wrapper_helper_skipped,
+    )
 
     documentation = ""
     if settings.fetch_documentation:
@@ -4078,6 +4529,7 @@ def _extract_one_wrapper(
                 selected_container=selected_container,
                 container_refs=container_refs,
                 output_path=udt_output_path,
+                wrapper_configfile_max_bytes=settings.wrapper_configfile_max_bytes,
             )
         )
         udt_yaml_files = [str(Path(udt_yaml_path).relative_to(expanded_root.parent))]
@@ -4112,6 +4564,9 @@ def _extract_one_wrapper(
         subcommands=subcommands,
         invocation_patterns=invocation_patterns,
         command_text=command_text,
+        wrapper_helper_files=wrapper_helper_files,
+        wrapper_configfiles=wrapper_configfiles,
+        wrapper_source_summary=wrapper_source_summary,
         input_parameter_types=p_types,
         input_datatypes=in_types,
         output_datatypes=out_types,

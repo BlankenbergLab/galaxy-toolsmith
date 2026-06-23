@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galaxy-toolsmith"
-version = "0.1.0"
+version = "0.2.0"
 description = "Library-first toolkit for Galaxy wrapper dataset, training, and generation workflows."
 readme = "README.md"
 requires-python = ">=3.11"

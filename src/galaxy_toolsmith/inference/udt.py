@@ -224,7 +224,7 @@ def conversion_warnings(data: dict[str, Any]) -> list[str]:
                 notes.append(
                     f"converter: unsupported output type '{output_type}' for {item.get('name', '')}."
                 )
-    return sorted(set(note for note in notes if note))
+    return sorted({note for note in notes if note})
 
 
 def udt_structural_report(udt_yaml: str) -> dict[str, Any]:
@@ -347,12 +347,14 @@ def _configfiles_xml(
             notes.append("converter: ignored non-object configfile entry.")
             continue
         name = str(configfile.get("name") or configfile.get("filename") or f"config_{index}")
+        filename = str(configfile.get("filename", "") or "").strip()
         content = _convert_template_expressions(
             str(configfile.get("content", "")),
             notes=notes,
             allow_lossy_conversion=allow_lossy_conversion,
         )
-        lines.append(f'    <configfile name="{_xml_attr(name)}"><![CDATA[')
+        filename_attr = f' filename="{_xml_attr(filename)}"' if filename else ""
+        lines.append(f'    <configfile name="{_xml_attr(name)}"{filename_attr}><![CDATA[')
         lines.append(content.replace("]]>", "]] >"))
         lines.append("    ]]></configfile>")
     lines.append("  </configfiles>")
@@ -379,9 +381,7 @@ def _input_xml(item: Any, *, notes: list[str]) -> list[str]:
             attrs["format"] = str(fmt)
         if item.get("collection_type"):
             attrs["collection_type"] = str(item["collection_type"])
-    if input_type == "select" and item.get("multiple") is True:
-        attrs["multiple"] = "true"
-    elif input_type == "data" and item.get("multiple") is True:
+    if input_type in {"data", "select"} and item.get("multiple") is True:
         attrs["multiple"] = "true"
     if item.get("optional") is True:
         attrs["optional"] = "true"

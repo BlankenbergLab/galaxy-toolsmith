@@ -232,6 +232,8 @@ gtsm extract-corpus \
 | `--bioconda-checkout-sources` | Resolve conda recipes and checkout/download upstream package source. Starts with Bioconda recipes and can use conda-forge feedstocks when Bioconda is missing or unusable. |
 | `--bioconda-ref <git-ref>` | Bioconda recipes ref for recipe/source resolution. Defaults to `master`. |
 | `--synthesize-udt-yaml` | Write deterministic Galaxy User-Defined Tool YAML targets for each XML wrapper. This enables `udt-yaml` and `mixed` training when a repository does not ship native UDT files. |
+| `--wrapper-source-max-bytes <n>` | Maximum bytes for wrapper-local helper source files recorded as context. Defaults to `256000`. |
+| `--wrapper-configfile-max-bytes <n>` | Maximum stored bytes for each inline wrapper `<configfile>` context block. Oversized configfiles are truncated for context and omitted from synthesized UDT YAML. Defaults to `256000`. |
 
 Container execution records every attempted candidate, selected runtime, command
 probe, return code, and help classification. Singularity/Apptainer is preferred
@@ -253,8 +255,20 @@ stopping the entire corpus run.
 When `--synthesize-udt-yaml` is enabled, extraction emits schema-valid UDT YAML
 targets under the corpus dataset directory and records `udt_yaml_path` on each
 wrapper record. The synthesized targets preserve the expanded wrapper command,
-inputs, outputs, selected container, and help text where those fields map
-directly from Galaxy XML.
+inputs, outputs, selected container, inline configfiles, and help text where
+those fields map directly from Galaxy XML.
+
+Extraction also records wrapper-local source context when the XML command
+references helper scripts such as Python, R, or shell files in the tool
+directory, and it records inline `<configfile>` templates while preserving mixed
+XML content when present. Source-context
+training and generation modes include that wrapper-local context before
+upstream package source because it is closest to the wrapper behavior. During
+generation, that context is used to understand the command line; prompts still
+prefer self-contained XML/UDT artifacts and avoid creating new external helper
+files or script-like configfiles unless explicitly required. Helper and
+configfile capture byte limits are configurable with
+`--wrapper-source-max-bytes` and `--wrapper-configfile-max-bytes`.
 
 ### `rebuild-execution-report`
 

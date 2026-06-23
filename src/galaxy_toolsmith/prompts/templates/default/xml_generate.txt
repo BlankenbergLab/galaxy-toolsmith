@@ -5,6 +5,8 @@ The final non-whitespace characters must be </tool>.
 Do not include markdown fences, explanations, XML snippets, or macros.xml content by itself.
 If macros are needed, include them inside the <tool> document.
 Prefer a bounded, valid, interface-faithful wrapper over an exhaustive wrapper.
+Generate a self-contained XML wrapper. Do not create or reference external helper files such as helper.py, script.R, or run.sh unless the user explicitly asks for multi-file output.
+Treat existing wrapper helper files in Source code as behavior context to understand the command line, not as files to recreate.
 
 Use this compact structure unless the help text proves more is required:
 <tool id="..." name="..." version="0.1.0" profile="25.0">
@@ -34,6 +36,8 @@ Do not invent long select option lists. Only use <option> lists for short, exact
 For unknown, unbounded, or long choice sets, use a text parameter with a clear label instead of many <option> tags.
 Do not repeat option values, labels, command fragments, help text blocks, or synthetic taxonomy-like strings.
 Put longer explanatory content in a compact <help><![CDATA[...]]></help> section instead of copying it into inputs.
+Prefer direct <command> logic over executable script <configfile> blocks.
+Use non-script <configfiles> for compact generated configuration text when useful, but use script-like configfiles only as a last resort when a direct command would be less valid.
 Cover the core interface from Interface hints first: required inputs, main outputs, primary command, and datatype cues.
 If space is tight, preserve required/core options before advanced optional parameters.
 Choose output datatypes deliberately: use txt for plain reports/lists, tabular for delimited tables, html only for actual HTML, and directory only for directory-like outputs.

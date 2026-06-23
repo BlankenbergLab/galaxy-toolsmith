@@ -6,6 +6,8 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from galaxy_toolsmith.cli import main as cli_main
+from galaxy_toolsmith.core.paths import WorkspacePaths
+from galaxy_toolsmith.inference.generation import generate_wrapper_from_content
 from galaxy_toolsmith.inference.udt import (
     UDT_SCHEMA_URI,
     UdtConversionError,
@@ -15,9 +17,6 @@ from galaxy_toolsmith.inference.udt import (
     udt_yaml_to_tool_xml,
     validate_udt_yaml,
 )
-from galaxy_toolsmith.core.paths import WorkspacePaths
-from galaxy_toolsmith.inference.generation import generate_wrapper_from_content
-
 
 CAT_UDT = """class: GalaxyUserTool
 id: cat_user_defined
@@ -106,6 +105,35 @@ def test_udt_to_xml_converts_simple_user_tool() -> None:
     assert "cat '$input1' > output.txt" in result.xml
     assert '<param name="input1" type="data" format="txt"/>' in result.xml
     assert '<data name="output1" format="txt" from_work_dir="output.txt"/>' in result.xml
+
+
+def test_udt_to_xml_preserves_configfile_filename() -> None:
+    udt = """class: GalaxyUserTool
+id: config_tool
+version: "0.1"
+name: config_tool
+container: busybox
+shell_command: cat '$(inputs.input1.path)' > output.txt
+configfiles:
+  - name: settings
+    filename: settings.json
+    content: |
+      {"threads": 1}
+inputs:
+  - name: input1
+    type: data
+    format: txt
+outputs:
+  - name: output1
+    type: data
+    format: txt
+    from_work_dir: output.txt
+"""
+
+    result = udt_yaml_to_tool_xml(udt)
+
+    assert '<configfile name="settings" filename="settings.json"><![CDATA[' in result.xml
+    assert '{"threads": 1}' in result.xml
 
 
 def test_udt_to_xml_rejects_unsupported_js_expression_by_default() -> None:

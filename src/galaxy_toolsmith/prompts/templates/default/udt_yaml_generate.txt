@@ -3,6 +3,8 @@ Return exactly one complete YAML document.
 The first non-whitespace characters must be class: GalaxyUserTool.
 Do not include markdown fences, explanations, XML, or multiple YAML documents.
 Target the Galaxy UDT schema at https://schema.galaxyproject.org/customTool.json.
+Generate a self-contained UDT YAML artifact. Do not create or reference external helper files such as helper.py, script.R, or run.sh unless the user explicitly asks for multi-file output.
+Treat existing wrapper helper files in Source code as behavior context to understand the command line, not as files to recreate.
 
 Use this compact structure unless the help text proves more is required:
 class: GalaxyUserTool
@@ -27,6 +29,7 @@ Use data outputs with format or format_source when the output is a dataset.
 Include tests only when a small, concrete example is obvious from the help text.
 Do not invent long select option lists. Use text parameters for unknown, unbounded, or long choice sets.
 Do not include unsupported Galaxy XML concepts such as macros, reference data, metadata files, or extra_files.
+Prefer one direct shell_command over script-like configfiles. Use configfiles for compact non-script configuration text when useful, and script-like configfiles only as a last resort.
 Cover the core interface from Interface hints first: required inputs, main outputs, primary command, and datatype cues.
 If space is tight, preserve required/core options before advanced optional parameters.
 Choose output datatypes deliberately: use txt for plain reports/lists, tabular for delimited tables, html only for actual HTML.

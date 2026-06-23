@@ -27,6 +27,7 @@ FILE_SAMPLE_BYTES = 8192
 
 SOURCE_EXTENSIONS = {
     ".awk",
+    ".bash",
     ".c",
     ".cc",
     ".cfg",
@@ -184,10 +185,13 @@ class SourceContextResult:
 
 @dataclass(frozen=True)
 class _SourceFile:
-    path: Path
-    root: Path
+    path: Path | None
+    root: Path | None
     relpath: str
     score: int
+    label: str = "Source file"
+    inline_text: str | None = None
+    included_path: str = ""
 
 
 def normalize_source_context_mode(mode: str | None) -> str:
@@ -226,12 +230,16 @@ def build_source_context_from_record(
 
     mappings = _record_bioconda_sources(record)
     roots = _source_roots_from_record(mappings)
+    wrapper_sources = _wrapper_sources_from_record(record)
+    wrapper_metadata = _format_wrapper_source_metadata(record)
     if settings.source_root is not None:
         roots.append(settings.source_root)
     files = [settings.source_file] if settings.source_file is not None else []
     return _build_source_context(
         settings=settings,
         metadata_mappings=mappings,
+        wrapper_metadata=wrapper_metadata,
+        wrapper_sources=wrapper_sources,
         roots=roots,
         files=files,
     )
@@ -269,6 +277,8 @@ def build_source_context_from_paths(
     return _build_source_context(
         settings=settings,
         metadata_mappings=[],
+        wrapper_metadata="",
+        wrapper_sources=[],
         roots=[source_root] if source_root is not None else [],
         files=[source_file] if source_file is not None else [],
     )
@@ -293,6 +303,121 @@ def _record_bioconda_sources(record: Mapping[str, Any]) -> list[Mapping[str, Any
     if not isinstance(raw_sources, Sequence) or isinstance(raw_sources, (str, bytes)):
         return []
     return [source for source in raw_sources if isinstance(source, Mapping)]
+
+
+def _record_sequence(record: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    raw = record.get(key, [])
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    return [item for item in raw if isinstance(item, Mapping)]
+
+
+def _wrapper_sources_from_record(record: Mapping[str, Any]) -> list[_SourceFile]:
+    sources: list[_SourceFile] = []
+    for item in _record_sequence(record, "wrapper_helper_files"):
+        raw_path = str(item.get("path", "") or "").strip()
+        relpath = str(item.get("relative_path", "") or Path(raw_path).name).strip()
+        if not raw_path or not relpath:
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.exists() or not path.is_file() or not _is_readable_text_source(path):
+            continue
+        sources.append(
+            _SourceFile(
+                path=path,
+                root=path.parent,
+                relpath=relpath,
+                score=1000 + _score_path(relpath, keywords=()),
+                label="Existing wrapper helper file",
+                included_path=str(path),
+            )
+        )
+    for item in _record_sequence(record, "wrapper_configfiles"):
+        content = str(item.get("content", "") or "")
+        if not content.strip():
+            continue
+        name = str(item.get("name", "") or "configfile").strip()
+        filename = str(item.get("filename", "") or "").strip()
+        relpath = filename or name
+        template_kind = str(item.get("template_kind") or item.get("role_hint") or "")
+        referenced = bool(item.get("referenced_by_command"))
+        base_score = 980 if template_kind == "script_template" and referenced else 950
+        if template_kind == "config_template" and not referenced:
+            base_score = 930
+        elif template_kind == "other_template":
+            base_score = 900
+        sources.append(
+            _SourceFile(
+                path=None,
+                root=None,
+                relpath=relpath,
+                score=base_score + _score_path(relpath, keywords=()),
+                label="Existing wrapper configfile",
+                inline_text=content,
+                included_path=f"configfile:{name}",
+            )
+        )
+    return sources
+
+
+def _format_wrapper_source_metadata(record: Mapping[str, Any]) -> str:
+    helper_files = _record_sequence(record, "wrapper_helper_files")
+    configfiles = _record_sequence(record, "wrapper_configfiles")
+    summary = record.get("wrapper_source_summary", {})
+    if not helper_files and not configfiles and not summary:
+        return ""
+    blocks = ["Wrapper source metadata:\n"]
+    if isinstance(summary, Mapping):
+        for key in (
+            "helper_file_count",
+            "configfile_count",
+            "truncated_configfile_count",
+            "skipped_file_count",
+        ):
+            value = summary.get(key)
+            if value not in (None, ""):
+                blocks.append(f"- {key}: {value}\n")
+        skip_reasons = summary.get("skip_reasons")
+        if isinstance(skip_reasons, Mapping) and skip_reasons:
+            reasons = ", ".join(f"{key}={value}" for key, value in sorted(skip_reasons.items()))
+            blocks.append(f"- skip_reasons: {reasons}\n")
+    for item in helper_files:
+        relpath = str(item.get("relative_path", "") or "").strip()
+        sha = str(item.get("sha256", "") or "").strip()
+        if relpath:
+            blocks.append(f"- helper: {relpath}")
+            if sha:
+                blocks.append(f" sha256={sha[:16]}")
+            blocks.append("\n")
+    for item in configfiles:
+        name = str(item.get("name", "") or "").strip()
+        filename = str(item.get("filename", "") or "").strip()
+        template_kind = str(item.get("template_kind") or item.get("role_hint") or "").strip()
+        language = str(item.get("language", "") or "").strip()
+        referenced = item.get("referenced_by_command")
+        truncated = item.get("content_truncated")
+        stored_byte_count = item.get("stored_byte_count")
+        sha = str(item.get("sha256", "") or "").strip()
+        label = filename or name
+        if label:
+            blocks.append(f"- configfile: {label}")
+            details = []
+            if template_kind:
+                details.append(f"kind={template_kind}")
+            if language:
+                details.append(f"language={language}")
+            if referenced in {True, False}:
+                details.append(f"referenced_by_command={str(referenced).lower()}")
+            if truncated in {True, False}:
+                details.append(f"content_truncated={str(truncated).lower()}")
+            if truncated is True and stored_byte_count not in (None, ""):
+                details.append(f"stored_bytes={stored_byte_count}")
+            if sha:
+                details.append(f"sha256={sha[:16]}")
+            if details:
+                blocks.append(f" {' '.join(details)}")
+            blocks.append("\n")
+    return "".join(blocks).rstrip() + "\n"
 
 
 def _source_roots_from_record(mappings: Sequence[Mapping[str, Any]]) -> list[Path]:
@@ -324,6 +449,8 @@ def _build_source_context(
     *,
     settings: SourceContextSettings,
     metadata_mappings: Sequence[Mapping[str, Any]],
+    wrapper_metadata: str,
+    wrapper_sources: Sequence[_SourceFile],
     roots: Sequence[Path | None],
     files: Sequence[Path | None],
 ) -> SourceContextResult:
@@ -345,6 +472,14 @@ def _build_source_context(
             max_chars=settings.max_chars,
             truncated=truncated,
         )
+    if wrapper_metadata:
+        used, truncated = _append_with_budget(
+            parts,
+            used,
+            wrapper_metadata,
+            max_chars=settings.max_chars,
+            truncated=truncated,
+        )
 
     if settings.mode == SOURCE_CONTEXT_MODE_METADATA:
         return SourceContextResult(
@@ -358,7 +493,7 @@ def _build_source_context(
             errors=tuple(errors),
         )
 
-    candidate_files: list[_SourceFile] = []
+    candidate_files: list[_SourceFile] = list(wrapper_sources)
     for file_path in files:
         if file_path is None:
             continue
@@ -392,13 +527,19 @@ def _build_source_context(
             truncated = True
 
     for source_file in selected_files:
-        text, file_error = _read_source_file(source_file.path)
-        if file_error:
-            errors.append(file_error)
+        if source_file.inline_text is not None:
+            text = source_file.inline_text
+        elif source_file.path is not None:
+            text, file_error = _read_source_file(source_file.path)
+            if file_error:
+                errors.append(file_error)
+                continue
+        else:
             continue
         digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
         block = (
-            f"\nSource file: {source_file.relpath}\nsha256: {digest}\n```\n{text.rstrip()}\n```\n"
+            f"\n{source_file.label}: {source_file.relpath}\n"
+            f"sha256: {digest}\n```\n{text.rstrip()}\n```\n"
         )
         previous_used = used
         used, truncated = _append_with_budget(
@@ -410,7 +551,7 @@ def _build_source_context(
         )
         if used > previous_used:
             included_files += 1
-            included_paths.append(str(source_file.path))
+            included_paths.append(source_file.included_path or str(source_file.path or ""))
         if used >= settings.max_chars:
             break
 
@@ -563,10 +704,18 @@ def _dedupe_source_files(files: Sequence[_SourceFile]) -> list[_SourceFile]:
     seen: set[str] = set()
     deduped: list[_SourceFile] = []
     for source_file in files:
-        try:
-            key = str(source_file.path.resolve())
-        except OSError:
-            key = str(source_file.path)
+        if source_file.inline_text is not None:
+            digest = hashlib.sha256(
+                source_file.inline_text.encode("utf-8", errors="replace")
+            ).hexdigest()
+            key = f"inline:{source_file.label}:{source_file.relpath}:{digest}"
+        elif source_file.path is not None:
+            try:
+                key = str(source_file.path.resolve())
+            except OSError:
+                key = str(source_file.path)
+        else:
+            key = f"unknown:{source_file.label}:{source_file.relpath}"
         if key in seen:
             continue
         seen.add(key)
