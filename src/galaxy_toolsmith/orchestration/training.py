@@ -47,9 +47,24 @@ def _load_dataset_id(dataset_manifest_path: Path) -> str:
 
 def _corpus_container_help_counts(corpus_jsonl_path: Path) -> dict[str, int]:
     if not corpus_jsonl_path.exists():
-        return {"corpus_records": 0, "container_help_records": 0}
+        return {
+            "corpus_records": 0,
+            "container_help_records": 0,
+            "container_usage_records": 0,
+            "container_api_validation_records": 0,
+            "container_api_validation_ok_records": 0,
+            "container_api_validation_failed_records": 0,
+            "api_backed_wrapper_records": 0,
+            "configfile_command_doc_records": 0,
+        }
     records = 0
     with_container_help = 0
+    with_container_usage = 0
+    with_api_validation = 0
+    with_api_validation_ok = 0
+    with_api_validation_failed = 0
+    api_backed_wrappers = 0
+    with_configfile_command_docs = 0
     with corpus_jsonl_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -62,7 +77,42 @@ def _corpus_container_help_counts(corpus_jsonl_path: Path) -> dict[str, int]:
                 continue
             if str(record.get("container_help_text", "")).strip():
                 with_container_help += 1
-    return {"corpus_records": records, "container_help_records": with_container_help}
+            if str(record.get("container_usage_text", "")).strip():
+                with_container_usage += 1
+            api_validation = record.get("container_api_validation", [])
+            if isinstance(api_validation, list) and api_validation:
+                with_api_validation += 1
+                has_ok = False
+                has_failed = False
+                for event in api_validation:
+                    if not isinstance(event, dict):
+                        continue
+                    status = str(event.get("status", "") or "")
+                    if status == "container-api-validation-ok":
+                        has_ok = True
+                    elif status == "container-api-validation-failed":
+                        has_failed = True
+                if has_ok:
+                    with_api_validation_ok += 1
+                if has_failed:
+                    with_api_validation_failed += 1
+            wrapper_summary = record.get("wrapper_source_summary", {})
+            if not isinstance(wrapper_summary, dict):
+                wrapper_summary = {}
+            if wrapper_summary.get("api_backed_wrapper"):
+                api_backed_wrappers += 1
+            if int(wrapper_summary.get("configfile_command_doc_count", 0) or 0) > 0:
+                with_configfile_command_docs += 1
+    return {
+        "corpus_records": records,
+        "container_help_records": with_container_help,
+        "container_usage_records": with_container_usage,
+        "container_api_validation_records": with_api_validation,
+        "container_api_validation_ok_records": with_api_validation_ok,
+        "container_api_validation_failed_records": with_api_validation_failed,
+        "api_backed_wrapper_records": api_backed_wrappers,
+        "configfile_command_doc_records": with_configfile_command_docs,
+    }
 
 
 def _training_command_error(error: subprocess.CalledProcessError) -> str:
@@ -483,15 +533,23 @@ def _write_live_training_metrics(
 
 def _record_training_help_text(record: dict) -> str:
     help_text = str(record.get("help_text", "")).strip()
-    container_help_text = str(record.get("container_help_text", "")).strip()
-    if not container_help_text or container_help_text in help_text:
-        return help_text or container_help_text
-    sections = []
+    runtime_sections = [
+        (
+            "Command-line help collected from container execution",
+            str(record.get("container_help_text", "")).strip(),
+        ),
+        (
+            "Command-line usage collected from container execution",
+            str(record.get("container_usage_text", "")).strip(),
+        ),
+    ]
+    sections: list[str] = []
     if help_text:
         sections.append(help_text)
-    sections.append(
-        "Command-line help collected from container execution:\n\n" + container_help_text
-    )
+    for label, text in runtime_sections:
+        if not text or text in help_text:
+            continue
+        sections.append(f"{label}:\n\n{text}")
     return "\n\n".join(sections)
 
 

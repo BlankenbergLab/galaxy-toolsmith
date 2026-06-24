@@ -24,14 +24,14 @@ conda activate "$PWD/.conda/gtsm"
 The expanded equivalent is:
 
 ```bash
-~/miniforge3/bin/conda create -y -p .conda/gtsm -c conda-forge -c bioconda python=3.11 apptainer
+~/miniforge3/bin/conda create -y -p .conda/gtsm -c conda-forge -c bioconda python=3.11 apptainer squashfuse libfuse3
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate "$PWD/.conda/gtsm"
 python -m pip install --upgrade pip
 python -m pip install -e ".[training,server,eval]"
 ```
 
-Python 3.11 is correct for this project (`requires-python >=3.11`). `apptainer` provides the Singularity-compatible runtime used by the corpus extraction command on linux-64.
+Python 3.11 is correct for this project (`requires-python >=3.11`). `apptainer` provides the Singularity-compatible runtime used by the corpus extraction command on linux-64. `squashfuse` lets Apptainer mount cached SIF images directly when user FUSE is available, and `libfuse3` provides the env-local `sbin/fusermount3` helper. Without host FUSE support (`/dev/fuse`), Galaxy Toolsmith's default SIF execution mode uses a persistent sandbox cache to avoid repeated temporary extraction where possible.
 
 If the `mamba` wrapper in the Miniforge base environment fails with an import error, do not repair the base environment for this workflow. Use the default `conda`-based `make install` path above. On machines with a working alternative solver, override environment creation explicitly:
 
@@ -58,13 +58,19 @@ gtsm sync-galaxy-skills --ref main
 gtsm sync-galaxy-xsd --ref dev
 gtsm extract-corpus \
   --max-workers 8 \
+  --source-workers 8 \
   --no-fetch-docs \
   --resolve-containers \
   --execute-containers \
   --container-runtime auto \
+  --container-prepare-workers 2 \
+  --container-probe-workers 4 \
   --container-help-probe-mode exploratory \
   --container-cache-dir .gtsm-cache/containers \
+  --container-sif-exec-mode auto \
+  --source-download-timeout-seconds 60 \
   --status-log .gtsm-cache/logs/extract-corpus.status.jsonl \
+  --retry-manifest .gtsm-cache/datasets/tools-iuc-corpus.retry-manifest.json \
   --bioconda-checkout-sources \
   --bioconda-ref master
 ```
@@ -73,16 +79,33 @@ Equivalent Makefile flow:
 
 ```bash
 make sync
-make extract-corpus MAX_WORKERS=8 CONTAINER_RUNTIME=auto STATUS_LOG=.gtsm-cache/logs/extract-corpus.status.jsonl
+make extract-corpus MAX_WORKERS=8 CONTAINER_RUNTIME=auto SOURCE_DOWNLOAD_TIMEOUT_SECONDS=60 STATUS_LOG=.gtsm-cache/logs/extract-corpus.status.jsonl
 ```
 
-Extraction execution mode expands Galaxy XML macros before deriving requirements, commands, and container refs. It resolves explicit `<container>` refs and Galaxy-compatible mulled/BioContainers names from package requirements, validates generated mulled tags against Quay, and records all plausible candidates. During execution, candidates are prepared lazily per wrapper: the first candidate that provides useful help stops further image preparation for that wrapper. Prepared images are still shared across wrappers, downloaded depot images are stored in the Singularity/Apptainer cache, and Docker is only used as a fallback for Docker-compatible image refs.
+Extraction execution mode expands Galaxy XML macros before deriving requirements, commands, and container refs. It resolves explicit `<container>` refs and Galaxy-compatible mulled/BioContainers names from package requirements, validates generated mulled tags against Quay, and records all plausible candidates. Wrapper parsing, upstream source checkout, container image preparation, and container help/API probing have separate concurrency controls. During execution, candidates are prepared lazily per wrapper: the first candidate that provides useful help stops further image preparation for that wrapper. Prepared images are shared across wrappers, downloaded depot images are stored in the Singularity/Apptainer cache, and Docker is only used as a fallback for Docker-compatible image refs.
 
 `extract-corpus` emits JSON status events before and during container execution, including restart cleanup, wrapper counts, Bioconda recipe/source preparation, container runtime discovery, per-wrapper completion, and final summary. Add `--status-log .gtsm-cache/logs/extract-corpus.status.jsonl` to keep the same stream in a file. `--no-fetch-docs` is recommended for large exploratory container/source runs because GitHub README fetching adds many quiet network requests that are not needed for command-line help extraction.
 
+Completed runs also write recovery diagnostics and a retry manifest. If the
+manifest path already exists, `--retry-manifest` limits extraction to the listed
+wrappers and then writes an updated manifest. This is useful for spot-checking
+known bad tools before committing to a full corpus rerun.
+
 When `--bioconda-checkout-sources` is enabled, the Bioconda recipes checkout is prepared once before wrapper workers start, then upstream source checkouts are cached per package/version and reused across restarts. If the current recipe does not match the wrapper requirement version, extraction searches the local Bioconda git history for the newest exact matching recipe and otherwise falls back to the closest semver-style recipe. If Bioconda has no usable recipe/source for a requirement, Galaxy Toolsmith can check the matching conda-forge feedstock and record that fallback as `source_channel: conda-forge`. Source checkout resolves the real upstream software source from the recipe, including git sources and HTTP(S)/FTP source archives; the extracted source tree is what later source-context training uses. Recipe/source data is also used to identify likely installed CLI entry points. Low-confidence wrapper shell fragments, helper commands, local script paths, and generic output names are skipped instead of being probed.
 
+Source retrieval also handles common historical-package edge cases. If a recipe
+points at a binary release artifact, Galaxy Toolsmith can try upstream tag
+source archives. Older Bioconductor and CRAN packages are recovered from archive
+URLs when the direct `src/contrib` URL has moved. Legacy source hosts that
+redirect to stale HTTPS certificates are retried for source collection, with
+the original URL and fallback reason kept in diagnostics. Source docs are
+mined from README/manual/help/example material and documentation directories,
+not generic build files, so command-line context is useful for training without
+encouraging generated wrappers to create helper scripts.
+
 The default `--container-help-probe-mode exploratory` preflights each candidate binary with `command -v`, then tries `--help`, `-h`, `help`, and finally a no-argument probe in an isolated temporary working directory. Probes run under `bash` first because many Bioconda images rely on bash-compatible activation snippets; if bash is unavailable, the probe falls back to `sh`.
+
+For Apptainer/Singularity runs, keep `squashfuse` and `libfuse3` available in the same conda environment as `gtsm`. Galaxy Toolsmith prepends that environment's `bin` and `sbin` directories to subprocess `PATH`, allowing Apptainer to find helper binaries such as `squashfuse`, `mount.fuse3`, and `fusermount3` even when `gtsm` is invoked by absolute path. Direct SIF mounting still depends on host policy: `/dev/fuse` must be present for user FUSE mounts. When it is not present, the default `--container-sif-exec-mode auto` materializes cached SIF images into reusable sandboxes under `.gtsm-cache/containers/sandboxes/`. This is compatible with extraction and avoids repeated per-probe temporary conversion. Use `--container-sif-exec-mode sif` to preserve raw runtime behavior, or `--container-sif-exec-mode sandbox` to force persistent sandbox use during spot checks.
 
 Only output classified as real help is appended to the corpus. Some tools return nonzero for useful help, for example `unrecognized option --help` followed by `Usage:` and option text; these are kept as `container-command-help-degraded` after stripping the leading error boilerplate. Missing commands, wrapper-local script paths, shell setup fragments, unresolved container placeholders, and non-help banners remain in `container_execution` or candidate skip metadata and are not appended. If one attempted candidate image does not contain the selected command, extraction can try the next plausible candidate while preserving cache state.
 

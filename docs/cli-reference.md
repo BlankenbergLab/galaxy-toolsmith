@@ -70,6 +70,18 @@ Commands with `--status-log <jsonl>` stream structured progress events to both
 console and the JSONL file. These logs are intended for long corpus extraction,
 training, benchmark, server, and remote-worker runs.
 
+### HTTP Identity
+
+Outbound HTTP requests use a product User-Agent by default:
+`Galaxy-Toolsmith/<version> (+https://github.com/BlankenbergLab/galaxy-toolsmith)`.
+Set `GTSM_HTTP_USER_AGENT` to override this for sites that require a local
+contact string or deployment-specific identifier.
+Public retrieval paths, such as source archives, README fetches, container
+metadata, depot images, and XSD sync, retry selected access/transient failures
+with a Chrome-shaped compatibility User-Agent. Override that fallback with
+`GTSM_HTTP_BROWSER_FALLBACK_USER_AGENT`. Provider APIs and local service calls
+continue to use the product User-Agent only.
+
 ## Setup and Introspection
 
 ### `doctor`
@@ -197,11 +209,17 @@ from a `tools-iuc` checkout.
 ```bash
 gtsm extract-corpus \
   --max-workers 32 \
+  --source-workers 8 \
   --resolve-containers \
   --execute-containers \
   --container-runtime auto \
   --container-cache-dir .gtsm-cache/containers \
+  --container-sif-exec-mode auto \
+  --container-prepare-workers 2 \
+  --container-probe-workers 4 \
   --container-help-probe-mode exploratory \
+  --source-download-timeout-seconds 60 \
+  --source-download-max-bytes 0 \
   --bioconda-checkout-sources \
   --synthesize-udt-yaml \
   --status-log .gtsm-cache/logs/extract-corpus.status.jsonl
@@ -215,6 +233,7 @@ gtsm extract-corpus \
 | `--restart` | Archive existing output/checkpoint/index/execution artifacts and reprocess from scratch while keeping reusable caches. |
 | `--status-log <jsonl>` | Write structured extraction progress. |
 | `--max-workers <n>` | Parallel wrapper extraction workers. |
+| `--source-workers <n>` | Maximum concurrent upstream source checkout/download operations. Defaults to `min(8, --max-workers)`. |
 | `--retries <n>` | Per-tool parse retries. |
 | `--no-fetch-docs` | Skip GitHub README fetching from `.shed.yml` homepages. Recommended for large source/container runs. |
 | `--resolve-containers` | Resolve explicit containers, mulled/BioContainers names, and package-derived container candidates. |
@@ -224,6 +243,16 @@ gtsm extract-corpus \
 | `--container-runtime apptainer` | Require Apptainer. |
 | `--container-runtime docker` | Require Docker. |
 | `--container-cache-dir <dir>` | Cache prepared Singularity/Apptainer images. Defaults to `.gtsm-cache/containers`. |
+| `--container-sif-exec-mode auto` | Singularity/Apptainer SIF execution mode. `auto` uses direct SIF mounting when user FUSE is available and otherwise reuses a persistent sandbox cache. |
+| `--container-sif-exec-mode sif` | Preserve direct SIF runtime behavior; Apptainer/Singularity may do its own temporary sandbox conversion when FUSE is unavailable. |
+| `--container-sif-exec-mode sandbox` | Always materialize and reuse a persistent sandbox for cached SIF images. |
+| `--container-prepare-workers <n>` | Maximum concurrent image prepare/build/pull operations. Defaults to `2`. |
+| `--container-probe-workers <n>` | Maximum concurrent container help/API probe workers. Defaults to `4`. |
+| `--container-image-timeout-seconds <n>` | Timeout for image download/build/pull operations. Defaults to `300`. |
+| `--container-image-quarantine-seconds <n>` | Seconds to skip a timed-out image before trying again. Defaults to `86400`. |
+| `--container-image-quarantine-file <json>` | Persistent image quarantine file. Defaults to `<container-cache-dir>/image-quarantine.json`, so known slow/failed image builds are skipped across reruns until their quarantine expires. |
+| `--source-download-timeout-seconds <n>` | Timeout for upstream source archive download requests. Defaults to `60`. |
+| `--source-download-max-bytes <n>` | Maximum bytes to download for one upstream source archive. `0` means unlimited. Plain integers are bytes; SI suffixes like `1GB` are decimal and IEC suffixes like `1GiB` are binary. If the server reports `Content-Length`, oversized archives are skipped before streaming. Defaults to `0`. |
 | `--container-help-probe-mode safe` | Probe conservative help forms only. |
 | `--container-help-probe-mode exploratory` | Probe `--help`, `-h`, `help`, and no-argument forms in an isolated temporary directory. Default. |
 | `--singularity-depot-url <url>` | Galaxy Singularity depot URL checked before `docker://` fallback. |
@@ -232,19 +261,56 @@ gtsm extract-corpus \
 | `--bioconda-checkout-sources` | Resolve conda recipes and checkout/download upstream package source. Starts with Bioconda recipes and can use conda-forge feedstocks when Bioconda is missing or unusable. |
 | `--bioconda-ref <git-ref>` | Bioconda recipes ref for recipe/source resolution. Defaults to `master`. |
 | `--synthesize-udt-yaml` | Write deterministic Galaxy User-Defined Tool YAML targets for each XML wrapper. This enables `udt-yaml` and `mixed` training when a repository does not ship native UDT files. |
+| `--retry-manifest <json>` | If the file exists, target only wrappers listed in it; after extraction, write an updated retry/failure manifest to the same path. Defaults beside the corpus output. |
 | `--wrapper-source-max-bytes <n>` | Maximum bytes for wrapper-local helper source files recorded as context. Defaults to `256000`. |
 | `--wrapper-configfile-max-bytes <n>` | Maximum stored bytes for each inline wrapper `<configfile>` context block. Oversized configfiles are truncated for context and omitted from synthesized UDT YAML. Defaults to `256000`. |
 
 Container execution records every attempted candidate, selected runtime, command
-probe, return code, and help classification. Singularity/Apptainer is preferred
-for Galaxy-compatible images; Docker is fallback only when selected directly or
-when the automatic runtime path reaches Docker.
+probe, return code, and help classification. Wrapper extraction, source
+checkout, container image preparation, and container probing have separate
+concurrency controls so slow source downloads or image builds do not block the
+whole corpus writer. Singularity/Apptainer is preferred for Galaxy-compatible
+images; Docker is fallback only when selected directly or when the automatic
+runtime path reaches Docker. Docker can avoid the SIF path for Docker-compatible
+image references, but it is not used as a SIF mount workaround because FUSE
+mounting still depends on host device and privilege support.
+
+Install `squashfuse` alongside Apptainer when using cached SIF images, but treat
+it as an optimization rather than a requirement. If `squashfuse`, `fusermount3`,
+and host `/dev/fuse` are available, Apptainer can mount SIF files directly. If
+user FUSE is unavailable, the default `--container-sif-exec-mode auto`
+materializes a persistent sandbox under the container cache and reuses it across
+help probes. If sandbox creation fails, extraction can still fall back to the
+runtime's normal SIF execution path, including Apptainer's temporary conversion
+behavior. This is slower, but remains a valid and compatible extraction path.
 
 Source checkout mode resolves real upstream software source, not only recipes.
 It supports archive URLs including HTTP(S) and FTP, git URLs, version-aware
 recipe selection, and cached source extraction per package/version/channel.
+
+Each completed run writes recovery diagnostics under the dataset diagnostics
+directory and copies them into the run snapshot. These include
+`failure-inventory.json`, `failure-samples.json`, `retry-manifest.json`, and
+`recovery-summary.md`. The retry manifest groups hard and partial wrapper
+issues by root-cause category so targeted reruns can be performed before a full
+corpus rebuild or training run.
 Mappings record `source_channel` so downstream training can distinguish
-Bioconda and conda-forge provenance.
+Bioconda and conda-forge provenance. When recipe metadata points at a packaged
+artifact instead of source, such as a GitHub release JAR, source checkout tries
+matching source archives from the same upstream tag. It also handles common
+archive moves, including older Bioconductor package tarballs under
+`Archive/<Package>/`, and retries legacy source hosts that redirect to HTTPS
+with stale certificates. These recoveries are recorded in `source_attempts` and
+`source_fallback_reason` so diagnostics can still distinguish exact recipe
+URLs from inferred source fallbacks.
+
+During extraction, the source tree is scanned for command-oriented
+documentation from README/manual/help/example files and documentation
+directories. Build files such as `CMakeLists.txt` are ignored for this purpose
+so source documentation is useful for command-line generation rather than build
+configuration. Captured source snippets are appended to `help_text` as
+`Underlying software source documentation` and can be included in training or
+generation prompts through the source-context options.
 
 Wrapper XML macro expansion uses Galaxy's `galaxy.tool_util.loader` path first,
 which is the same macro machinery Planemo relies on internally. If Galaxy's
@@ -892,6 +958,8 @@ gtsm list-promotion-policies
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
+| `GTSM_HTTP_USER_AGENT` | Public retrieval and HTTP providers | Product User-Agent. Defaults to `Galaxy-Toolsmith/<version> (+https://github.com/BlankenbergLab/galaxy-toolsmith)`. |
+| `GTSM_HTTP_BROWSER_FALLBACK_USER_AGENT` | Public retrieval retry | Browser-shaped compatibility User-Agent used after selected retrieval failures. |
 | `GTSM_MODEL_SOURCE_REGISTRY` | Training/export/local inference | Hugging Face-compatible registry endpoint. Falls back to `HF_ENDPOINT`. |
 | `GTSM_MODEL_REVISION` | Training/export/local inference | Model revision pin. |
 | `GTSM_MODEL_CACHE_ROOT` | Training/export/local inference | Model cache root. Falls back to `HF_HOME`; otherwise defaults under `.gtsm-cache/models/hf-cache`. |

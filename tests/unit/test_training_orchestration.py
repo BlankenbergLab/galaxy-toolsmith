@@ -20,6 +20,7 @@ from galaxy_toolsmith.orchestration.training import (
     _axolotl_subprocess_environment,
     _build_sft_args,
     _build_sft_trainer,
+    _corpus_container_help_counts,
     _deepspeed_zero3_config,
     _ensure_deepspeed_available,
     _fsdp_transformer_layer_cls,
@@ -28,6 +29,7 @@ from galaxy_toolsmith.orchestration.training import (
     _load_instruction_records_with_diagnostics,
     _model_load_kwargs,
     _read_new_log_lines,
+    _record_training_help_text,
     _select_backend,
     _write_axolotl_runtime_compat,
     get_local_training_run,
@@ -123,6 +125,68 @@ def _write_trainable_corpus(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return corpus_jsonl
+
+
+def test_record_training_help_text_includes_container_usage_once() -> None:
+    help_text = _record_training_help_text(
+        {
+            "help_text": "Wrapper help",
+            "container_help_text": "Usage: tool --input FILE",
+            "container_usage_text": "$ tool\nUsage: tool <command>",
+        }
+    )
+
+    assert "Wrapper help" in help_text
+    assert "Command-line help collected from container execution" in help_text
+    assert "Usage: tool --input FILE" in help_text
+    assert "Command-line usage collected from container execution" in help_text
+    assert "$ tool" in help_text
+
+    deduped = _record_training_help_text(
+        {
+            "help_text": "Wrapper help\n\nUsage: tool --input FILE",
+            "container_help_text": "Usage: tool --input FILE",
+            "container_usage_text": "",
+        }
+    )
+
+    assert deduped.count("Usage: tool --input FILE") == 1
+
+
+def test_corpus_container_help_counts_include_runtime_and_configfile_fields(
+    tmp_path: Path,
+) -> None:
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    records = [
+        {
+            "container_help_text": "Usage: alpha",
+            "container_usage_text": "$ alpha\nUsage: alpha",
+            "container_api_validation": [{"status": "container-api-validation-ok"}],
+            "wrapper_source_summary": {
+                "api_backed_wrapper": True,
+                "configfile_command_doc_count": 1,
+            },
+        },
+        {
+            "container_api_validation": [{"status": "container-api-validation-failed"}],
+            "wrapper_source_summary": {"api_backed_wrapper": True},
+        },
+    ]
+    corpus_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    counts = _corpus_container_help_counts(corpus_jsonl)
+
+    assert counts["corpus_records"] == 2
+    assert counts["container_help_records"] == 1
+    assert counts["container_usage_records"] == 1
+    assert counts["container_api_validation_records"] == 2
+    assert counts["container_api_validation_ok_records"] == 1
+    assert counts["container_api_validation_failed_records"] == 1
+    assert counts["api_backed_wrapper_records"] == 2
+    assert counts["configfile_command_doc_records"] == 1
 
 
 def test_model_load_kwargs_uses_bf16_for_non_quantized_cuda() -> None:

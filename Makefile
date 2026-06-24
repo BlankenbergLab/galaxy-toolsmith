@@ -5,6 +5,7 @@ PYTHON := $(ENV_DIR)/bin/python
 GTSM ?= $(ENV_DIR)/bin/gtsm
 
 MAX_WORKERS ?= 8
+SOURCE_WORKERS ?= 8
 TOOLS_REF ?= main
 GALAXY_SKILLS_REF ?= main
 GALAXY_XSD_REF ?= dev
@@ -12,17 +13,28 @@ BIOCONDA_REF ?= master
 PROFILE ?= agentic-devstral-24b
 CONTAINER_RUNTIME ?= auto
 CONTAINER_CACHE_DIR ?= .gtsm-cache/containers
+CONTAINER_SIF_EXEC_MODE ?= auto
 CONTAINER_HELP_PROBE_MODE ?= exploratory
+CONTAINER_PREPARE_WORKERS ?= 2
+CONTAINER_PROBE_WORKERS ?= 4
+CONTAINER_IMAGE_TIMEOUT_SECONDS ?= 300
+CONTAINER_IMAGE_QUARANTINE_SECONDS ?= 86400
+CONTAINER_IMAGE_QUARANTINE_FILE ?=
+SOURCE_DOWNLOAD_TIMEOUT_SECONDS ?= 60
 DOCKER_USE_SUDO ?= 0
 NO_FETCH_DOCS ?= 1
 STATUS_LOG ?=
 CORPUS_JSONL ?= .gtsm-cache/datasets/tools-iuc-corpus.jsonl
 CORPUS_CHECKPOINT ?= .gtsm-cache/datasets/tools-iuc-corpus.checkpoint
+RETRY_MANIFEST ?= .gtsm-cache/datasets/tools-iuc-corpus.retry-manifest.json
+SYNTHESIZE_UDT_YAML ?= 0
 RESTART ?= 0
 EXTRACT_RESTART_FLAG := $(if $(filter 1 true yes,$(RESTART)),--restart,)
 EXTRACT_DOCKER_SUDO_FLAG := $(if $(filter 1 true yes,$(DOCKER_USE_SUDO)),--docker-use-sudo,)
 EXTRACT_NO_FETCH_DOCS_FLAG := $(if $(filter 1 true yes,$(NO_FETCH_DOCS)),--no-fetch-docs,)
 EXTRACT_STATUS_LOG_FLAG := $(if $(STATUS_LOG),--status-log $(STATUS_LOG),)
+EXTRACT_SYNTHESIZE_UDT_FLAG := $(if $(filter 1 true yes,$(SYNTHESIZE_UDT_YAML)),--synthesize-udt-yaml,)
+EXTRACT_CONTAINER_QUARANTINE_FILE_FLAG := $(if $(CONTAINER_IMAGE_QUARANTINE_FILE),--container-image-quarantine-file $(CONTAINER_IMAGE_QUARANTINE_FILE),)
 GGUF_EXPORT_ENV_DIR ?= .conda/gtsm-unsloth-export
 LLAMA_CPP_DIR ?= .gtsm-cache/llama.cpp
 LLAMA_CPP_REF ?= master
@@ -48,7 +60,7 @@ OLLAMA_TEST_BIN ?=
 env-linux: $(PYTHON)
 
 $(PYTHON):
-	$(ENV_CREATE) -y -p $(ENV_DIR) -c conda-forge -c bioconda python=3.11 apptainer
+	$(ENV_CREATE) -y -p $(ENV_DIR) -c conda-forge -c bioconda python=3.11 apptainer squashfuse libfuse3
 
 install: env-linux
 	$(PYTHON) -m pip install --upgrade pip
@@ -56,7 +68,7 @@ install: env-linux
 
 install-active:
 	@test -n "$$CONDA_PREFIX" || (echo "CONDA_PREFIX is not set; activate a conda env first." >&2; exit 2)
-	$(CONDA_EXE) install -y -p "$$CONDA_PREFIX" -c conda-forge -c bioconda apptainer
+	$(CONDA_EXE) install -y -p "$$CONDA_PREFIX" -c conda-forge -c bioconda apptainer squashfuse libfuse3
 	python -m pip install --upgrade pip
 	python -m pip install -e ".[training,server,eval]"
 
@@ -71,6 +83,10 @@ doctor-active:
 	@gtsm --help >/dev/null
 	@echo "apptainer=$$(command -v apptainer || true)"
 	@apptainer --version
+	@echo "squashfuse=$$(command -v squashfuse || true)"
+	@echo "fusermount3=$$(command -v fusermount3 || true)"
+	@echo "env_fusermount3=$$(test -x "$$CONDA_PREFIX/sbin/fusermount3" && echo "$$CONDA_PREFIX/sbin/fusermount3" || true)"
+	@echo "dev_fuse=$$(test -e /dev/fuse && echo present || echo missing)"
 
 sync:
 	$(GTSM) init-workspace
@@ -81,6 +97,7 @@ sync:
 extract-corpus:
 	$(GTSM) extract-corpus $(EXTRACT_RESTART_FLAG) \
 		--max-workers $(MAX_WORKERS) \
+		--source-workers $(SOURCE_WORKERS) \
 		--output $(CORPUS_JSONL) \
 		--checkpoint $(CORPUS_CHECKPOINT) \
 		$(EXTRACT_NO_FETCH_DOCS_FLAG) \
@@ -88,10 +105,19 @@ extract-corpus:
 		--execute-containers \
 		--container-runtime $(CONTAINER_RUNTIME) \
 		--container-cache-dir $(CONTAINER_CACHE_DIR) \
+		--container-sif-exec-mode $(CONTAINER_SIF_EXEC_MODE) \
+		--container-prepare-workers $(CONTAINER_PREPARE_WORKERS) \
+		--container-probe-workers $(CONTAINER_PROBE_WORKERS) \
+		--container-image-timeout-seconds $(CONTAINER_IMAGE_TIMEOUT_SECONDS) \
+		--container-image-quarantine-seconds $(CONTAINER_IMAGE_QUARANTINE_SECONDS) \
+		$(EXTRACT_CONTAINER_QUARANTINE_FILE_FLAG) \
+		--source-download-timeout-seconds $(SOURCE_DOWNLOAD_TIMEOUT_SECONDS) \
 		--container-help-probe-mode $(CONTAINER_HELP_PROBE_MODE) \
 		$(EXTRACT_STATUS_LOG_FLAG) \
+		--retry-manifest $(RETRY_MANIFEST) \
 		--bioconda-checkout-sources \
 		--bioconda-ref $(BIOCONDA_REF) \
+		$(EXTRACT_SYNTHESIZE_UDT_FLAG) \
 		$(EXTRACT_DOCKER_SUDO_FLAG)
 
 train:

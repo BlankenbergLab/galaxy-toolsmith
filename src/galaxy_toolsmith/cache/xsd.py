@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib import request as urlrequest
 
 from galaxy_toolsmith.core.paths import WorkspacePaths
+from galaxy_toolsmith.http_client import urlopen_with_user_agent_fallback
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ def sync_galaxy_xsd(paths: WorkspacePaths, ref: str = "dev") -> XSDSyncResult:
     destination = paths.xsd_root / "galaxy.xsd"
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    with urlrequest.urlopen(url, timeout=60) as response:
+    with urlopen_with_user_agent_fallback(url, timeout=60) as response:
         content = response.read()
 
     destination.write_bytes(content)

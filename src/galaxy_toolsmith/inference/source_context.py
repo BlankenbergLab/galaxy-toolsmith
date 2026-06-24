@@ -229,7 +229,10 @@ def build_source_context_from_record(
         return _empty_result(settings)
 
     mappings = _record_bioconda_sources(record)
-    roots = _source_roots_from_record(mappings)
+    roots = _source_roots_from_record(
+        mappings,
+        include_weak=settings.mode == SOURCE_CONTEXT_MODE_ALL_RAW,
+    )
     wrapper_sources = _wrapper_sources_from_record(record)
     wrapper_metadata = _format_wrapper_source_metadata(record)
     if settings.source_root is not None:
@@ -420,11 +423,33 @@ def _format_wrapper_source_metadata(record: Mapping[str, Any]) -> str:
     return "".join(blocks).rstrip() + "\n"
 
 
-def _source_roots_from_record(mappings: Sequence[Mapping[str, Any]]) -> list[Path]:
+def _source_mapping_allows_file_context(
+    mapping: Mapping[str, Any],
+    *,
+    include_weak: bool = False,
+) -> bool:
+    checkout = str(mapping.get("source_checkout", "")).strip()
+    if not checkout:
+        return False
+    if bool(mapping.get("source_is_binary_artifact", False)):
+        return False
+    if Path(checkout).name.lower().endswith((".jar", ".whl", ".gem")):
+        return False
+    confidence = str(mapping.get("source_confidence", "") or "exact").strip().lower()
+    if confidence == "weak" and not include_weak:
+        return False
+    return True
+
+
+def _source_roots_from_record(
+    mappings: Sequence[Mapping[str, Any]],
+    *,
+    include_weak: bool = False,
+) -> list[Path]:
     roots: list[Path] = []
     for mapping in mappings:
-        checkout = str(mapping.get("source_checkout", "")).strip()
-        if checkout:
+        if _source_mapping_allows_file_context(mapping, include_weak=include_weak):
+            checkout = str(mapping.get("source_checkout", "")).strip()
             roots.append(Path(checkout).expanduser())
     return _dedupe_existing_paths(roots)
 
@@ -604,11 +629,28 @@ def _format_source_metadata(mappings: Sequence[Mapping[str, Any]]) -> str:
         "required_version",
         "recipe_path",
         "recipe_version",
+        "recipe_selection_reason",
+        "source_confidence",
+        "source_version_match",
         "recipe_commit",
         "source_url",
         "source_ref",
         "source_checkout",
+        "source_is_binary_artifact",
+        "source_artifact_url",
+        "source_fallback_reason",
         "source_error",
+        "fallback_from_channel",
+        "fallback_from_recipe_selection_reason",
+        "fallback_from_source_error",
+        "source_provider_package",
+        "source_provider_required_version",
+        "source_provider_channel",
+        "source_provider_recipe_package",
+        "source_provider_recipe_path",
+        "source_provider_source_url",
+        "source_provider_source_ref",
+        "source_provider_reason",
     )
     for index, mapping in enumerate(mappings, start=1):
         blocks.append(f"- source {index}:\n")
@@ -627,7 +669,12 @@ def _format_source_metadata(mappings: Sequence[Mapping[str, Any]]) -> str:
 def _keywords_from_mappings(mappings: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     keywords: set[str] = set()
     for mapping in mappings:
-        for key in ("package", "required_version"):
+        for key in (
+            "package",
+            "required_version",
+            "source_provider_package",
+            "source_provider_recipe_package",
+        ):
             keyword = _keyword(str(mapping.get(key, "")))
             if keyword:
                 keywords.add(keyword)

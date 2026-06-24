@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pwd
+import re
 import shlex
 import signal
 import socket
@@ -12,6 +13,7 @@ import sys
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from galaxy_toolsmith.cache.sources import sync_galaxy_skills, sync_tools_iuc
@@ -87,6 +89,45 @@ from galaxy_toolsmith.runtime.status import emit_status, resolve_status_log_path
 from galaxy_toolsmith.server.app import serve
 
 PLANEMO_ENGINE_CHOICES = ("galaxy", "docker_galaxy", "cwltool", "toil", "external_galaxy")
+_BYTE_CAP_RE = re.compile(
+    r"^\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>b|[kmgtp](?:i?b?)?)?\s*$", re.I
+)
+_BYTE_CAP_MULTIPLIERS = {
+    "": 1,
+    "b": 1,
+    "k": 1000,
+    "kb": 1000,
+    "ki": 1024,
+    "kib": 1024,
+    "m": 1000**2,
+    "mb": 1000**2,
+    "mi": 1024**2,
+    "mib": 1024**2,
+    "g": 1000**3,
+    "gb": 1000**3,
+    "gi": 1024**3,
+    "gib": 1024**3,
+    "t": 1000**4,
+    "tb": 1000**4,
+    "ti": 1024**4,
+    "tib": 1024**4,
+    "p": 1000**5,
+    "pb": 1000**5,
+    "pi": 1024**5,
+    "pib": 1024**5,
+}
+
+
+def _parse_optional_byte_cap(value: str) -> int:
+    match = _BYTE_CAP_RE.match(value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "expected a non-negative byte count, or a size like 512MB/1GiB; use 0 for unlimited"
+        )
+    unit = (match.group("unit") or "").lower()
+    multiplier = _BYTE_CAP_MULTIPLIERS[unit]
+    parsed = Decimal(match.group("size")) * multiplier
+    return int(parsed)
 
 
 def _add_planemo_test_args(parser: argparse.ArgumentParser) -> None:
@@ -294,6 +335,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     extract_parser.add_argument("--max-workers", type=int, default=4, help="Max parallel workers.")
     extract_parser.add_argument(
+        "--source-workers",
+        type=int,
+        default=0,
+        help=(
+            "Maximum concurrent source checkout/download operations "
+            "(default: min(8, --max-workers))."
+        ),
+    )
+    extract_parser.add_argument(
+        "--container-prepare-workers",
+        type=int,
+        default=2,
+        help="Maximum concurrent container image prepare/build/pull operations.",
+    )
+    extract_parser.add_argument(
+        "--container-probe-workers",
+        type=int,
+        default=4,
+        help="Maximum concurrent container help/API probe workers.",
+    )
+    extract_parser.add_argument(
         "--retries", type=int, default=3, help="Retries per tool on parse failures."
     )
     extract_parser.add_argument(
@@ -323,10 +385,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory for cached Singularity/Apptainer images (default: .gtsm-cache/containers).",
     )
     extract_parser.add_argument(
+        "--container-sif-exec-mode",
+        choices=("auto", "sif", "sandbox"),
+        default="auto",
+        help=(
+            "How Singularity/Apptainer executes cached SIF images: auto uses direct SIF "
+            "mounting when user FUSE is available and otherwise reuses a persistent "
+            "sandbox cache; sif preserves direct runtime behavior; sandbox always "
+            "materializes a reusable sandbox."
+        ),
+    )
+    extract_parser.add_argument(
         "--container-help-probe-mode",
         choices=("safe", "exploratory"),
         default="exploratory",
         help="Container help probe strategy (default: exploratory; tries more safe fallbacks).",
+    )
+    extract_parser.add_argument(
+        "--container-image-timeout-seconds",
+        type=int,
+        default=300,
+        help="Timeout for container image download/build/pull operations.",
+    )
+    extract_parser.add_argument(
+        "--container-image-quarantine-seconds",
+        type=int,
+        default=86400,
+        help="Seconds to skip an image after a prepare timeout/failure quarantine.",
+    )
+    extract_parser.add_argument(
+        "--container-image-quarantine-file",
+        default="",
+        help=(
+            "JSON file for persistent container image quarantine state "
+            "(default: <container-cache-dir>/image-quarantine.json)."
+        ),
+    )
+    extract_parser.add_argument(
+        "--source-download-timeout-seconds",
+        type=int,
+        default=60,
+        help="Timeout for upstream source archive download requests.",
+    )
+    extract_parser.add_argument(
+        "--source-download-max-bytes",
+        type=_parse_optional_byte_cap,
+        default=0,
+        help=(
+            "Maximum bytes to download for one upstream source archive "
+            "(default: 0, unlimited; accepts sizes like 512MB or 1GiB)."
+        ),
     )
     extract_parser.add_argument(
         "--singularity-depot-url",
@@ -357,6 +465,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--synthesize-udt-yaml",
         action="store_true",
         help="Write deterministic Galaxy User-Defined Tool YAML targets for each extracted XML wrapper.",
+    )
+    extract_parser.add_argument(
+        "--retry-manifest",
+        default="",
+        help=(
+            "Read an existing retry manifest to target listed wrappers, then write an updated "
+            "retry/failure manifest to the same path (default: alongside output JSONL)."
+        ),
     )
     extract_parser.add_argument(
         "--wrapper-source-max-bytes",
@@ -1827,10 +1943,18 @@ def main() -> int:
             inputs={
                 "tools_root": str(tools_root),
                 "max_workers": args.max_workers,
+                "source_workers": args.source_workers,
+                "container_prepare_workers": args.container_prepare_workers,
+                "container_probe_workers": args.container_probe_workers,
+                "container_image_timeout_seconds": args.container_image_timeout_seconds,
+                "container_image_quarantine_seconds": args.container_image_quarantine_seconds,
+                "container_image_quarantine_file": args.container_image_quarantine_file,
+                "container_sif_exec_mode": args.container_sif_exec_mode,
                 "fetch_documentation": not args.no_fetch_docs,
                 "resolve_containers": args.resolve_containers,
                 "execute_containers": args.execute_containers,
                 "synthesize_udt_yaml": args.synthesize_udt_yaml,
+                "source_download_max_bytes": args.source_download_max_bytes,
                 "wrapper_source_max_bytes": args.wrapper_source_max_bytes,
                 "wrapper_configfile_max_bytes": args.wrapper_configfile_max_bytes,
                 "restart": args.restart,
@@ -1840,6 +1964,9 @@ def main() -> int:
 
         settings = ExtractionSettings(
             max_workers=args.max_workers,
+            source_workers=args.source_workers,
+            container_prepare_workers=args.container_prepare_workers,
+            container_probe_workers=args.container_probe_workers,
             retries=args.retries,
             fetch_documentation=not args.no_fetch_docs,
             resolve_containers=args.resolve_containers,
@@ -1848,7 +1975,15 @@ def main() -> int:
             container_cache_dir=Path(args.container_cache_dir).resolve()
             if args.container_cache_dir
             else None,
+            container_sif_exec_mode=args.container_sif_exec_mode,
             container_help_probe_mode=args.container_help_probe_mode,
+            container_image_timeout_seconds=args.container_image_timeout_seconds,
+            container_image_quarantine_seconds=args.container_image_quarantine_seconds,
+            container_image_quarantine_file=Path(args.container_image_quarantine_file).resolve()
+            if args.container_image_quarantine_file
+            else None,
+            source_download_timeout_seconds=args.source_download_timeout_seconds,
+            source_download_max_bytes=args.source_download_max_bytes,
             singularity_depot_url=args.singularity_depot_url,
             docker_use_sudo=args.docker_use_sudo,
             remove_images_after_use=not args.no_remove_images,
@@ -1860,6 +1995,9 @@ def main() -> int:
             cache_root=paths.source_cache,
             restart=args.restart,
             status_log_path=status_log_path,
+            retry_manifest_path=Path(args.retry_manifest).resolve()
+            if args.retry_manifest
+            else None,
         )
         try:
             result = extract_tools_corpus(

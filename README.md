@@ -6,6 +6,9 @@ Galaxy Toolsmith is a library-first and CLI-driven toolkit for building datasets
 - Python package: `galaxy_toolsmith`
 - CLI: `gtsm`
 
+## Acknowledgements
+This work was supported by the Wellcome Trust [313498/Z/24/Z].
+
 ## Quick start
 ```bash
 gtsm doctor
@@ -71,6 +74,14 @@ make train PROFILE=agentic-devstral-24b
 
 If you already have a compatible conda environment active, use `make install-active` instead of creating `.conda/gtsm`.
 
+The Linux conda environment includes `apptainer`, `squashfuse`, and `libfuse3`.
+`apptainer` provides the Singularity-compatible container runtime, `squashfuse`
+mounts cached SIF images directly, and `libfuse3` provides the env-local
+`sbin/fusermount3` helper. Direct SIF mounting still requires host FUSE support
+(`/dev/fuse`). Without it, extraction remains valid: the default SIF execution
+mode reuses persistent sandboxes where possible and can still fall back to the
+runtime's normal temporary conversion behavior.
+
 `export-model` now supports multi-quant GGUF exports in one run with `--quantizations`.
 
 For no-sudo GGUF export on shared Linux nodes, build and use a user-space
@@ -99,6 +110,8 @@ Training defaults are accessibility-first and now make quantization state explic
 DeepSeek profiles are included as **opt-in evaluation defaults** (coding/distilled variants). Keep primary defaults on the existing Devstral/Mistral set unless DeepSeek variants pass your benchmark and promotion gates.
 
 Model download/source behavior can be controlled with:
+- `GTSM_HTTP_USER_AGENT` for outbound HTTP request identity; defaults to `Galaxy-Toolsmith/<version> (+https://github.com/BlankenbergLab/galaxy-toolsmith)`
+- `GTSM_HTTP_BROWSER_FALLBACK_USER_AGENT` for the Chrome-shaped compatibility retry used by public source/documentation retrieval when a request fails with access/transient errors
 - `GTSM_MODEL_SOURCE_REGISTRY` (or `HF_ENDPOINT`) for registry endpoint
 - `GTSM_MODEL_REVISION` for pinned model revision
 - `GTSM_MODEL_CACHE_ROOT` (or `HF_HOME`) for cache location; defaults to `.gtsm-cache/models/hf-cache`
@@ -165,3 +178,7 @@ gtsm train-artifacts-fetch --server-url http://127.0.0.1:8765 --job-id <job-id> 
   - `python -m mkdocs serve -a 127.0.0.1:8000`
 - Production docs deployment uses Cloudflare Workers static assets configured in `wrangler.jsonc`.
 - Full 4xA100 pipeline runbook: `docs/example.md`
+
+## Acknowledgements
+
+This work was supported by the Wellcome Trust [313498/Z/24/Z].

@@ -5,6 +5,7 @@ import os
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
+from galaxy_toolsmith.http_client import with_user_agent_headers
 from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.providers.base import (
     GenerationInput,
@@ -51,7 +52,7 @@ class OllamaProvider:
                 "num_predict": self.max_tokens,
             },
         }
-        headers = {"Content-Type": "application/json"}
+        headers = with_user_agent_headers({"Content-Type": "application/json"})
         if self.auth_header:
             if ":" in self.auth_header:
                 key, value = self.auth_header.split(":", 1)

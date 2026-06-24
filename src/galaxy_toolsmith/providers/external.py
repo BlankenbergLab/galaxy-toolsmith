@@ -5,6 +5,7 @@ import os
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
+from galaxy_toolsmith.http_client import with_user_agent_headers
 from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.providers.base import (
     GenerationInput,
@@ -31,6 +32,7 @@ def _prompt(request: GenerationInput) -> str:
 
 def _post_json(url: str, headers: dict[str, str], payload: dict, timeout: int = 120) -> dict:
     body = json.dumps(payload).encode("utf-8")
+    headers = with_user_agent_headers(headers)
     req = urlrequest.Request(url=url, data=body, headers=headers, method="POST")
     try:
         with urlrequest.urlopen(req, timeout=timeout) as response:

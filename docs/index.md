@@ -15,3 +15,7 @@ Use the CLI (`gtsm`) for workspace setup, corpus extraction, training, evaluatio
 1. Start with [Quick Start](quickstart.md).
 2. Review [CLI Reference](cli-reference.md).
 3. See [Architecture and Decisions](architecture.md) for design rationale.
+
+## Acknowledgements
+
+This work was supported by the Wellcome Trust [313498/Z/24/Z].

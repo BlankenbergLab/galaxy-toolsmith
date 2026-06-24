@@ -247,7 +247,19 @@ python '$script'
   ]]></command>
   <configfiles>
     <configfile name="script" filename="generated.py" foo="bar"><![CDATA[
-print("config helper")
+import scanpy as sc
+adata = sc.read_h5ad("anndata.h5ad")
+sc.pp.filter_cells(adata, min_counts=1)
+    ]]></configfile>
+    <configfile name="mainparams"><![CDATA[
+KEY PARAMETERS FOR THE PROGRAM structure.
+
+#define MAXPOPS    $main.MAXPOPS  // default:2      // (int) number of populations assumed
+
+Command line options:
+-m mainparams
+-e extraparams
+-K MAXPOPS
     ]]></configfile>
     <configfile name="settings" filename="settings.json"><![CDATA[
 {"mode": "fast"}
@@ -277,8 +289,19 @@ prefix <section attr="one"><item>$input</item></section> suffix
     helper_paths = {item["relative_path"] for item in record["wrapper_helper_files"]}
     assert helper_paths == {"helper.py", "plot.R", "scripts/run.sh"}
     assert record["wrapper_source_summary"]["helper_file_count"] == 3
-    assert record["wrapper_source_summary"]["configfile_count"] == 3
+    assert record["wrapper_source_summary"]["configfile_count"] == 4
     assert record["wrapper_source_summary"]["truncated_configfile_count"] == 0
+    assert record["wrapper_source_summary"]["api_backed_wrapper"] is True
+    assert record["wrapper_source_summary"]["configfile_api_call_count"] == 2
+    assert record["wrapper_source_summary"]["configfile_command_doc_count"] == 1
+    assert record["wrapper_source_summary"]["configfile_parameter_doc_count"] == 1
+    assert "Wrapper configfile context:" in record["help_text"]
+    assert "API calls used by generated wrapper scripts:" in record["help_text"]
+    assert "scanpy.read_h5ad, scanpy.pp.filter_cells" in record["help_text"]
+    assert "Command-line documentation embedded in wrapper configfiles:" in record["help_text"]
+    assert "-m mainparams" in record["help_text"]
+    assert "Parameter documentation embedded in wrapper configfiles:" in record["help_text"]
+    assert "MAXPOPS (default=2; type=int; number of populations assumed)" in record["help_text"]
     configfiles = {item["name"]: item for item in record["wrapper_configfiles"]}
     script_config = configfiles["script"]
     assert script_config["filename"] == "generated.py"
@@ -286,7 +309,17 @@ prefix <section attr="one"><item>$input</item></section> suffix
     assert script_config["template_kind"] == "script_template"
     assert script_config["language"] == "python"
     assert script_config["referenced_by_command"] is True
-    assert "config helper" in script_config["content"]
+    assert "sc.pp.filter_cells" in script_config["content"]
+    assert [call["qualified_call"] for call in script_config["api_calls"]] == [
+        "scanpy.read_h5ad",
+        "scanpy.pp.filter_cells",
+    ]
+    mainparams_config = configfiles["mainparams"]
+    assert mainparams_config["command_docs"][0]["kind"] == "command_line_options"
+    assert "-m mainparams" in mainparams_config["command_docs"][0]["text"]
+    assert mainparams_config["parameter_docs"][0]["name"] == "MAXPOPS"
+    assert mainparams_config["parameter_docs"][0]["default"] == "2"
+    assert mainparams_config["parameter_docs"][0]["type"] == "int"
     settings_config = configfiles["settings"]
     assert settings_config["template_kind"] == "config_template"
     assert settings_config["language"] == "json"
@@ -298,6 +331,118 @@ prefix <section attr="one"><item>$input</item></section> suffix
     assert "suffix" in xml_config["content"]
     assert xml_config["byte_count"] == xml_config["stored_byte_count"]
     assert xml_config["content_truncated"] is False
+
+
+def test_extract_corpus_records_api_calls_from_wrapper_helper_scripts(tmp_path: Path) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "alphagenome_tool"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: alphagenome_tool\nowner: iuc\n", encoding="utf-8")
+    (tool_dir / "alphagenome_helper.py").write_text(
+        """
+import argparse
+from alphagenome.models import dna_client
+
+parser = argparse.ArgumentParser(
+    description="Score genetic variants using AlphaGenome predict_variant()"
+)
+parser.add_argument("--output-types", default=["RNA_SEQ"], help="AlphaGenome output")
+client = dna_client.create(api_key="token")
+""".strip(),
+        encoding="utf-8",
+    )
+    (tool_dir / "alphagenome.xml").write_text(
+        """
+<tool id="alphagenome_tool" name="AlphaGenome Tool" version="1.0">
+  <requirements>
+    <requirement type="package" version="0.6.1">alphagenome</requirement>
+  </requirements>
+  <command><![CDATA[
+python '$__tool_directory__/alphagenome_helper.py' --input '$input' --output '$output'
+  ]]></command>
+  <inputs>
+    <param name="input" type="data" format="vcf"/>
+  </inputs>
+  <outputs>
+    <data name="output" format="vcf"/>
+  </outputs>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(max_workers=1, retries=1, fetch_documentation=False),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    helper = record["wrapper_helper_files"][0]
+    assert helper["relative_path"] == "alphagenome_helper.py"
+    assert [call["qualified_call"] for call in helper["api_calls"]] == [
+        "alphagenome.models.dna_client.create"
+    ]
+    assert record["wrapper_source_summary"]["helper_api_call_count"] == 1
+    assert record["wrapper_source_summary"]["api_backed_wrapper"] is True
+    assert "Wrapper helper context:" in record["help_text"]
+    assert "alphagenome.models.dna_client.create" in record["help_text"]
+
+
+def test_extract_corpus_treats_extensionless_referenced_python_configfile_as_script(
+    tmp_path: Path,
+) -> None:
+    tools_root = tmp_path / "tools"
+    tool_dir = tools_root / "api_config_tool"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / ".shed.yml").write_text("name: api_config_tool\nowner: iuc\n", encoding="utf-8")
+    (tool_dir / "api.xml").write_text(
+        """
+<tool id="api_config_tool" name="API Config Tool" version="1.0">
+  <requirements>
+    <requirement type="package" version="0.3.2">episcanpy</requirement>
+  </requirements>
+  <command><![CDATA[
+python '$script_file'
+  ]]></command>
+  <configfiles>
+    <configfile name="script_file"><![CDATA[
+import episcanpy as epi
+adata = epi.read("input.h5ad")
+epi.pp.binarize(adata)
+    ]]></configfile>
+  </configfiles>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    out_jsonl = tmp_path / "datasets" / "corpus.jsonl"
+    checkpoint = tmp_path / "datasets" / "corpus.checkpoint"
+    extract_tools_corpus(
+        tools_root=tools_root,
+        output_jsonl=out_jsonl,
+        checkpoint_file=checkpoint,
+        settings=ExtractionSettings(max_workers=1, retries=1, fetch_documentation=False),
+    )
+
+    record = json.loads(out_jsonl.read_text(encoding="utf-8").strip())
+    configfile = record["wrapper_configfiles"][0]
+    assert configfile["name"] == "script_file"
+    assert configfile["extension"] == ""
+    assert configfile["template_kind"] == "script_template"
+    assert configfile["referenced_by_command"] is True
+    assert record["wrapper_source_summary"]["api_backed_wrapper"] is True
+    assert [call["qualified_call"] for call in configfile["api_calls"]] == [
+        "episcanpy.read",
+        "episcanpy.pp.binarize",
+    ]
+    assert "Wrapper configfile context:" in record["help_text"]
+    assert "API calls used by generated wrapper scripts:" in record["help_text"]
+    assert "episcanpy.read, episcanpy.pp.binarize" in record["help_text"]
 
 
 def test_extract_corpus_truncates_large_configfiles_and_omits_from_udt(
@@ -679,6 +824,26 @@ def test_write_corpus_diagnostics(tmp_path: Path) -> None:
             tool_id="samtools_depth",
             wrapper_path="/tools/samtools/depth.xml",
             container_help_text="Usage: samtools depth",
+            container_usage_text="$ samtools depth\nUsage: samtools depth",
+            container_api_validation=[{"status": "container-api-validation-ok"}],
+            wrapper_source_summary={
+                "api_backed_wrapper": True,
+                "configfile_command_doc_count": 1,
+            },
+            bioconda_sources=[
+                {
+                    "package": "tabix",
+                    "source_provider_package": "htslib",
+                    "source_provider_reason": "source_less_run_dependency",
+                    "source_command_docs": [
+                        {
+                            "path": "README.md",
+                            "line": 3,
+                            "text": "Usage: tabix [options] file",
+                        }
+                    ],
+                }
+            ],
             container_execution=[
                 {
                     "phase": "run",
@@ -692,6 +857,7 @@ def test_write_corpus_diagnostics(tmp_path: Path) -> None:
             package_id="iuc/awk",
             tool_id="awk",
             wrapper_path="/tools/awk/awk.xml",
+            bioconda_sources=[{"package": "awk", "source_error": "source unavailable"}],
             container_execution=[
                 {
                     "phase": "run",
@@ -735,12 +901,50 @@ def test_write_corpus_diagnostics(tmp_path: Path) -> None:
         (diagnostics_dir / "container-help-coverage.json").read_text(encoding="utf-8")
     )
     assert coverage["records_without_container_help"] == 1
+    assert coverage["records_with_container_usage"] == 1
+    assert coverage["records_with_api_validation_ok"] == 1
+    assert coverage["api_backed_records"] == 1
+    assert coverage["configfile_doc_records"] == 1
+    assert coverage["source_command_doc_records"] == 1
+    assert coverage["records_with_source_provider"] == 1
+    assert coverage["source_provider_package_counts"] == {"htslib": 1}
+    assert coverage["source_provider_reason_counts"] == {"source_less_run_dependency": 1}
+    assert coverage["records_with_source_errors"] == 1
+    assert coverage["source_error_counts"] == {"source unavailable": 1}
     counts = (diagnostics_dir / "container-status-counts.txt").read_text(encoding="utf-8")
     assert "container-command-nonhelp" in counts
     samples = json.loads((diagnostics_dir / "nonhelp-samples.json").read_text(encoding="utf-8"))
     assert samples[0]["tool_id"] == "awk"
+    source_coverage = json.loads(
+        (diagnostics_dir / "source-coverage.json").read_text(encoding="utf-8")
+    )
+    assert source_coverage["records_with_source_mapping"] == 2
+    assert source_coverage["records_with_usable_source"] == 1
+    assert source_coverage["records_with_provider_source"] == 1
+    assert source_coverage["records_with_source_error"] == 1
+    assert source_coverage["source_status_counts"] == {
+        "provider_source": 1,
+        "source_error": 1,
+    }
+    source_missing = json.loads(
+        (diagnostics_dir / "source-missing.json").read_text(encoding="utf-8")
+    )
+    assert source_missing[0]["tool_id"] == "awk"
+    assert source_missing[0]["status"] == "source_error"
     integrity = json.loads((diagnostics_dir / "integrity.json").read_text(encoding="utf-8"))
     assert integrity["current_run"]["value"] == "run-1"
+    retry_manifest = json.loads(
+        (diagnostics_dir / "retry-manifest.json").read_text(encoding="utf-8")
+    )
+    assert retry_manifest["wrappers"]
+    assert any(item["tool_id"] == "awk" for item in retry_manifest["wrappers"])
+    failure_inventory = json.loads(
+        (diagnostics_dir / "failure-inventory.json").read_text(encoding="utf-8")
+    )
+    assert failure_inventory["summary"]["issue_wrappers"] >= 1
+    assert "bad_probe_variant" in failure_inventory["summary"]["category_counts"]
+    assert (diagnostics_dir / "failure-samples.json").exists()
+    assert (diagnostics_dir / "recovery-summary.md").exists()
 
 
 def test_extract_corpus_prepares_bioconda_repo_once_for_multiple_wrappers(

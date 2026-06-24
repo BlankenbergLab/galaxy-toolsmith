@@ -74,6 +74,29 @@ def test_metadata_mode_includes_source_metadata_without_files(tmp_path: Path) ->
     assert result.metadata_sources == 1
 
 
+def test_metadata_mode_includes_source_provider_fallback_fields(tmp_path: Path) -> None:
+    root = _source_tree(tmp_path)
+    record = _record(root)
+    record["bioconda_sources"][0].update(
+        {
+            "source_provider_package": "htslib",
+            "source_provider_required_version": "1.22.1",
+            "source_provider_recipe_package": "htslib",
+            "source_provider_source_url": "https://example.org/htslib-1.22.1.tar.bz2",
+            "source_provider_reason": "source_less_run_dependency",
+        }
+    )
+
+    result = build_source_context_from_record(
+        record,
+        source_context_settings(mode="metadata", max_chars=3000, max_files=3),
+    )
+
+    assert "source_provider_package: htslib" in result.text
+    assert "source_provider_source_url: https://example.org/htslib-1.22.1.tar.bz2" in result.text
+    assert "source_provider_reason: source_less_run_dependency" in result.text
+
+
 def test_snippets_mode_ranks_cli_files_and_excludes_tests(tmp_path: Path) -> None:
     root = _source_tree(tmp_path)
     result = build_source_context_from_record(
@@ -240,6 +263,33 @@ def test_all_filtered_excludes_tests_while_all_raw_can_include_them(tmp_path: Pa
     assert "tests/test_cli.py" not in filtered.text
     assert "Source file: tests/test_cli.py" in raw.text
     assert "reads.fastq" not in raw.text
+
+
+def test_all_filtered_skips_weak_source_roots_but_keeps_metadata(tmp_path: Path) -> None:
+    root = _source_tree(tmp_path)
+    record = _record(root)
+    record["bioconda_sources"][0].update(
+        {
+            "recipe_version": "1.9",
+            "recipe_selection_reason": "closest_major",
+            "source_confidence": "weak",
+            "source_version_match": "mismatch",
+        }
+    )
+
+    filtered = build_source_context_from_record(
+        record,
+        source_context_settings(mode="all-filtered", max_chars=8000, max_files=10),
+    )
+    raw = build_source_context_from_record(
+        record,
+        source_context_settings(mode="all-raw", max_chars=8000, max_files=10),
+    )
+
+    assert "source_confidence: weak" in filtered.text
+    assert "source_version_match: mismatch" in filtered.text
+    assert "Source file: src/mytool/cli.py" not in filtered.text
+    assert "Source file: src/mytool/cli.py" in raw.text
 
 
 def test_none_mode_preserves_manual_source_file_behavior(tmp_path: Path) -> None:

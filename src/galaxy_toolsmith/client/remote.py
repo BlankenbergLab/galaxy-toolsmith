@@ -8,6 +8,8 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor
 
+from galaxy_toolsmith.http_client import with_user_agent_headers
+
 
 def request_remote_generation(
     server_url: str,
@@ -16,7 +18,7 @@ def request_remote_generation(
     retries: int = 2,
 ) -> dict:
     url = server_url.rstrip("/") + "/generate"
-    headers = {"Content-Type": "application/json"}
+    headers = with_user_agent_headers({"Content-Type": "application/json"})
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     try:
@@ -58,7 +60,7 @@ def request_remote_json(
     timeout: float = 120.0,
 ) -> dict:
     url = server_url.rstrip("/") + endpoint
-    headers = {"Content-Type": "application/json"}
+    headers = with_user_agent_headers({"Content-Type": "application/json"})
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     try:
@@ -93,7 +95,7 @@ def download_remote_file(
     timeout: float = 300.0,
 ) -> Path:
     url = server_url.rstrip("/") + endpoint
-    headers = {}
+    headers = with_user_agent_headers()
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     destination.parent.mkdir(parents=True, exist_ok=True)

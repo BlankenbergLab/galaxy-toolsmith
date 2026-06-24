@@ -215,6 +215,20 @@ def test_extract_corpus_container_flags_parse() -> None:
             "/tmp/gtsm-containers",
             "--container-help-probe-mode",
             "safe",
+            "--source-workers",
+            "7",
+            "--container-prepare-workers",
+            "2",
+            "--container-probe-workers",
+            "5",
+            "--container-image-timeout-seconds",
+            "900",
+            "--container-image-quarantine-seconds",
+            "3600",
+            "--source-download-timeout-seconds",
+            "45",
+            "--source-download-max-bytes",
+            "1048576",
             "--singularity-depot-url",
             "https://example.org/singularity",
             "--status-log",
@@ -225,6 +239,8 @@ def test_extract_corpus_container_flags_parse() -> None:
             "1234",
             "--wrapper-configfile-max-bytes",
             "5678",
+            "--retry-manifest",
+            "/tmp/retry.json",
             "--restart",
         ]
     )
@@ -233,10 +249,38 @@ def test_extract_corpus_container_flags_parse() -> None:
     assert args.container_runtime == "apptainer"
     assert args.container_cache_dir == "/tmp/gtsm-containers"
     assert args.container_help_probe_mode == "safe"
+    assert args.source_workers == 7
+    assert args.container_prepare_workers == 2
+    assert args.container_probe_workers == 5
+    assert args.container_image_timeout_seconds == 900
+    assert args.container_image_quarantine_seconds == 3600
+    assert args.source_download_timeout_seconds == 45
+    assert args.source_download_max_bytes == 1048576
     assert args.singularity_depot_url == "https://example.org/singularity"
     assert args.status_log == "/tmp/extract.status.jsonl"
     assert args.docker_use_sudo is True
     assert args.bioconda_checkout_sources is True
     assert args.wrapper_source_max_bytes == 1234
     assert args.wrapper_configfile_max_bytes == 5678
+    assert args.retry_manifest == "/tmp/retry.json"
     assert args.restart is True
+
+
+def test_extract_corpus_source_download_max_bytes_human_sizes_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(["extract-corpus"])
+    assert args.source_download_max_bytes == 0
+    cases = {
+        "0": 0,
+        "1048576": 1048576,
+        "1KB": 1000,
+        "1KiB": 1024,
+        "1.5MB": 1500000,
+        "1gb": 1000**3,
+        "1 GiB": 1024**3,
+        "1GB": 1000**3,
+        "1GiB": 1024**3,
+    }
+    for value, expected in cases.items():
+        args = parser.parse_args(["extract-corpus", "--source-download-max-bytes", value])
+        assert args.source_download_max_bytes == expected
