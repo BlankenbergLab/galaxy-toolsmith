@@ -68,6 +68,10 @@ def test_train_backend_flags_parse() -> None:
             "1",
             "--gradient-accumulation-steps",
             "2",
+            "--learning-rate",
+            "2e-5",
+            "--training-method",
+            "full",
             "--status-log",
             "/tmp/train.status.jsonl",
             "--status-interval-seconds",
@@ -91,10 +95,46 @@ def test_train_backend_flags_parse() -> None:
     assert args.source_file == "/tmp/source.py"
     assert args.per_device_batch_size == 1
     assert args.gradient_accumulation_steps == 2
+    assert args.learning_rate == 2e-5
+    assert args.training_method == "full"
     assert args.status_log == "/tmp/train.status.jsonl"
     assert args.status_interval_seconds == 15
     assert args.stream_logs is True
     assert args.log_tail_lines == 7
+
+
+def test_train_mlx_backend_aliases_parse() -> None:
+    parser = _build_parser()
+    for backend in ("mlx-lm", "mlx", "mps"):
+        args = parser.parse_args(["train", "--backend", backend, "--dry-run-backend"])
+        assert args.backend == backend
+        assert args.dry_run_backend is True
+
+
+def test_convert_adapter_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "convert-adapter",
+            "--from",
+            "mlx",
+            "--to",
+            "peft",
+            "--base-model",
+            "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "--adapter-dir",
+            "/tmp/mlx",
+            "--output-dir",
+            "/tmp/peft",
+        ]
+    )
+
+    assert args.command == "convert-adapter"
+    assert args.from_format == "mlx"
+    assert args.to_format == "peft"
+    assert args.base_model == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert args.adapter_dir == "/tmp/mlx"
+    assert args.output_dir == "/tmp/peft"
 
 
 def test_train_runs_flags_parse() -> None:

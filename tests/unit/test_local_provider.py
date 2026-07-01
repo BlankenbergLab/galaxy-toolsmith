@@ -199,6 +199,135 @@ def test_local_provider_preloads_peft_variant_manifest(
     assert info["adapter_path"] == str(artifact_dir)
 
 
+def test_local_provider_preloads_hf_full_model_variant_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    artifact_dir = paths.models_root / "artifacts" / "variant-full"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "config.json").write_text("{}", encoding="utf-8")
+    (artifact_dir / "model.safetensors").write_text("model", encoding="utf-8")
+    (paths.models_root / "variants").mkdir(parents=True)
+    (paths.models_root / "variants" / "variant-full.manifest.json").write_text(
+        ModelVariantManifest(
+            variant_id="variant-full",
+            base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+            provider="local",
+            backend="axolotl",
+            training_method="full",
+            effective_training_method="full",
+            artifact_kind="hf_full_model",
+            artifact_dir=str(artifact_dir),
+        ).to_json(),
+        encoding="utf-8",
+    )
+    loaded = []
+
+    def fake_ensure_loaded(self: local_mod.LocalPeftProvider) -> dict:
+        loaded.append((self.base_model, self.adapter_path))
+        return {
+            "backend": self.name,
+            "base_model": self.base_model,
+            "adapter_path": self.adapter_path or "",
+        }
+
+    monkeypatch.setattr(local_mod.LocalPeftProvider, "ensure_loaded", fake_ensure_loaded)
+    provider = local_mod.LocalProvider(paths=paths)
+
+    info = provider.ensure_loaded("variant-full")
+
+    assert loaded == [(str(artifact_dir), None)]
+    assert info["model_loaded"] is True
+    assert info["backend"] == "local-peft"
+    assert info["adapter_path"] == ""
+
+
+def test_local_provider_uses_mlx_variant_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    artifact_dir = paths.models_root / "artifacts" / "variant-mlx"
+    artifact_dir.mkdir(parents=True)
+    (paths.models_root / "variants").mkdir(parents=True)
+    (artifact_dir / "adapters.safetensors").write_text("", encoding="utf-8")
+    (paths.models_root / "variants" / "variant-mlx.manifest.json").write_text(
+        ModelVariantManifest(
+            variant_id="variant-mlx",
+            base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+            provider="local",
+            backend="mlx-lm",
+            artifact_dir=str(artifact_dir),
+        ).to_json(),
+        encoding="utf-8",
+    )
+
+    def fake_generate(
+        self: local_mod.LocalMLXProvider,
+        request: GenerationInput,
+    ) -> GenerationOutput:
+        assert self.base_model == "Qwen/Qwen2.5-Coder-7B-Instruct"
+        assert self.adapter_path == str(artifact_dir)
+        assert self.source_policy.cache_dir == str(paths.models_root / "hf-cache")
+        return GenerationOutput(
+            xml_wrapper="<tool id='echo_tool' name='echo_tool' version='0.1.0'/>",
+            provider=self.name,
+            model_variant=request.model_variant,
+        )
+
+    monkeypatch.setattr(local_mod.LocalMLXProvider, "generate_wrapper", fake_generate)
+    provider = local_mod.LocalProvider(paths=paths)
+
+    output = provider.generate_wrapper(_request("variant-mlx"))
+
+    assert output.provider == "local-mlx"
+    assert output.model_variant == "variant-mlx"
+
+
+def test_local_provider_preloads_mlx_variant_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    artifact_dir = paths.models_root / "artifacts" / "variant-mlx"
+    artifact_dir.mkdir(parents=True)
+    (paths.models_root / "variants").mkdir(parents=True)
+    (artifact_dir / "adapters.safetensors").write_text("", encoding="utf-8")
+    (paths.models_root / "variants" / "variant-mlx.manifest.json").write_text(
+        ModelVariantManifest(
+            variant_id="variant-mlx",
+            base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+            provider="local",
+            backend="mlx-lm",
+            artifact_dir=str(artifact_dir),
+        ).to_json(),
+        encoding="utf-8",
+    )
+    loaded = []
+
+    def fake_ensure_loaded(self: local_mod.LocalMLXProvider) -> dict:
+        loaded.append(self.adapter_path)
+        return {
+            "backend": self.name,
+            "base_model": self.base_model,
+            "adapter_path": self.adapter_path,
+        }
+
+    monkeypatch.setattr(local_mod.LocalMLXProvider, "ensure_loaded", fake_ensure_loaded)
+    provider = local_mod.LocalProvider(paths=paths)
+
+    info = provider.ensure_loaded("variant-mlx")
+
+    assert loaded == [str(artifact_dir)]
+    assert info["model_loaded"] is True
+    assert info["backend"] == "local-mlx"
+    assert info["adapter_path"] == str(artifact_dir)
+
+
 def _install_fake_peft_runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,

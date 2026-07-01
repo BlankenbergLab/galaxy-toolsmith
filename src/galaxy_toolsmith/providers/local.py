@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shlex
@@ -9,8 +10,8 @@ from pathlib import Path
 
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.artifacts import (
-    ARTIFACT_FORMAT_XML,
     ARTIFACT_FORMAT_UDT_YAML,
+    ARTIFACT_FORMAT_XML,
     normalize_artifact_format,
 )
 from galaxy_toolsmith.prompts import render_prompt_template
@@ -28,6 +29,7 @@ from galaxy_toolsmith.runtime.model_source import (
 
 TOOL_CLOSE_DECODE_WINDOW_TOKENS = 64
 LOCAL_OFFLOAD_POLICIES = {"allow", "fail"}
+MLX_LM_BACKEND_ALIASES = {"mlx-lm", "mlx", "mps"}
 
 
 def _render_generation_prompt(request: GenerationInput) -> str:
@@ -323,7 +325,7 @@ class LocalPeftProvider:
         self,
         *,
         base_model: str,
-        adapter_path: str,
+        adapter_path: str | None,
         max_new_tokens: int = 4096,
         temperature: float = 0.1,
         source_policy: object | None = None,
@@ -349,13 +351,21 @@ class LocalPeftProvider:
 
         try:
             import torch
-            from peft import PeftModel
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as error:  # pragma: no cover - depends on optional runtime deps
             raise RuntimeError(
-                "Local PEFT inference requires torch, transformers, and peft. "
+                "Local HF inference requires torch and transformers. "
                 "Install training deps or use a configured external/local generator."
             ) from error
+        PeftModel = None
+        if self.adapter_path:
+            try:
+                from peft import PeftModel
+            except Exception as error:  # pragma: no cover - depends on optional runtime deps
+                raise RuntimeError(
+                    "Local PEFT inference requires peft. Install training deps or use a "
+                    "configured external/local generator."
+                ) from error
 
         apply_model_source_environment(self.source_policy)
         source_kwargs = model_source_load_kwargs(self.source_policy)
@@ -380,7 +390,8 @@ class LocalPeftProvider:
             load_kwargs["torch_dtype"] = torch.float32
 
         model = AutoModelForCausalLM.from_pretrained(self.base_model, **load_kwargs)
-        model = PeftModel.from_pretrained(model, self.adapter_path)
+        if self.adapter_path:
+            model = PeftModel.from_pretrained(model, self.adapter_path)
         model.eval()
         device_report = _device_map_report(model)
         if self.offload_policy == "fail" and device_report["has_offload"]:
@@ -403,7 +414,7 @@ class LocalPeftProvider:
         return {
             "backend": self.name,
             "base_model": self.base_model,
-            "adapter_path": self.adapter_path,
+            "adapter_path": self.adapter_path or "",
             **self._load_info,
         }
 
@@ -430,6 +441,111 @@ class LocalPeftProvider:
             provider=self.name,
             model_variant=request.model_variant,
         )
+
+
+class LocalMLXProvider:
+    name = "local-mlx"
+
+    def __init__(
+        self,
+        *,
+        base_model: str,
+        adapter_path: str,
+        max_new_tokens: int = 4096,
+        temperature: float = 0.1,
+        source_policy: object | None = None,
+    ):
+        self.base_model = base_model
+        self.adapter_path = adapter_path
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.source_policy = source_policy or resolve_model_source_policy()
+        self._model = None
+        self._tokenizer = None
+
+    def _lazy_load(self) -> tuple[object, object]:
+        if self._model is not None and self._tokenizer is not None:
+            return self._model, self._tokenizer
+
+        try:
+            from mlx_lm import load
+        except Exception as error:  # pragma: no cover - depends on optional runtime deps
+            raise RuntimeError(
+                "Local MLX inference requires mlx-lm. Install the mps extra or use another local generator."
+            ) from error
+
+        apply_model_source_environment(self.source_policy)
+        load_kwargs: dict = {
+            "adapter_path": self.adapter_path,
+            "tokenizer_config": {"trust_remote_code": True},
+        }
+        try:
+            load_parameters = inspect.signature(load).parameters
+        except (TypeError, ValueError):
+            load_parameters = {}
+        if "trust_remote_code" in load_parameters:
+            load_kwargs["trust_remote_code"] = True
+        revision = str(getattr(self.source_policy, "revision", "") or "")
+        if revision:
+            load_kwargs["revision"] = revision
+        model, tokenizer = load(self.base_model, **load_kwargs)
+        self._model = model
+        self._tokenizer = tokenizer
+        return model, tokenizer
+
+    def ensure_loaded(self) -> dict:
+        self._lazy_load()
+        return {
+            "backend": self.name,
+            "base_model": self.base_model,
+            "adapter_path": self.adapter_path,
+        }
+
+    def generate_wrapper(self, request: GenerationInput) -> GenerationOutput:
+        try:
+            from mlx_lm import generate
+            from mlx_lm.sample_utils import make_sampler
+        except Exception as error:  # pragma: no cover - depends on optional runtime deps
+            raise RuntimeError(
+                "Local MLX generation requires mlx-lm. Install the mps extra or use another local generator."
+            ) from error
+        model, tokenizer = self._lazy_load()
+        prompt = _mlx_prompt(tokenizer, _render_generation_prompt(request))
+        response_text = generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=self.max_new_tokens,
+            sampler=make_sampler(self.temperature),
+            verbose=False,
+        )
+        artifact = extract_generated_artifact(response_text, request.artifact_format)
+        if not artifact:
+            raise RuntimeError(
+                "LocalMLXProvider returned empty output after artifact stripping; "
+                f"base_model={self.base_model!r} adapter_path={self.adapter_path!r} "
+                f"raw_response_length={len(response_text)} "
+                f"raw_response_preview={_preview_text(response_text)!r}"
+            )
+        return GenerationOutput(
+            artifact_text=artifact,
+            artifact_format=request.artifact_format,
+            provider=self.name,
+            model_variant=request.model_variant,
+        )
+
+
+def _mlx_prompt(tokenizer: object, prompt: str) -> object:
+    if not getattr(tokenizer, "has_chat_template", False):
+        return prompt
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply_chat_template):
+        return prompt
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except TypeError:
+        return apply_chat_template(messages, add_generation_prompt=True)
 
 
 class LocalProvider:
@@ -467,6 +583,7 @@ class LocalProvider:
                 source_policy=resolve_model_source_policy(paths),
             )
         self._peft_providers: dict[str, LocalPeftProvider] = {}
+        self._mlx_providers: dict[str, LocalMLXProvider] = {}
 
     def _run_external_local_command(self, request: GenerationInput) -> str:
         payload = {
@@ -516,17 +633,31 @@ class LocalProvider:
         if cache_key in self._peft_providers:
             return self._peft_providers[cache_key]
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        base_model = self.model.strip() or str(manifest.get("base_model", "")).strip()
+        artifact_kind = str(manifest.get("artifact_kind", "") or "").strip().lower()
+        if artifact_kind == "unknown":
+            artifact_kind = ""
+        backend = str(manifest.get("backend", "") or "").strip().lower()
         artifact_dir = Path(str(manifest.get("artifact_dir", "")).strip())
-        if not base_model:
-            raise RuntimeError(f"Model variant manifest lacks base_model: {manifest_path}")
+        if artifact_kind in {"mlx_adapter", "mlx_full_weights"} or backend in MLX_LM_BACKEND_ALIASES:
+            return None
         if not artifact_dir.exists():
             raise RuntimeError(f"Model variant artifact_dir does not exist: {artifact_dir}")
-        if not (artifact_dir / "adapter_config.json").exists():
+        is_full_hf = artifact_kind == "hf_full_model"
+        is_peft = artifact_kind == "peft_adapter" or (
+            not artifact_kind and (artifact_dir / "adapter_config.json").exists()
+        )
+        if not is_full_hf and not is_peft:
             return None
+        base_model = self.model.strip() or (
+            str(artifact_dir)
+            if is_full_hf
+            else str(manifest.get("base_model", "")).strip()
+        )
+        if not base_model:
+            raise RuntimeError(f"Model variant manifest lacks base_model: {manifest_path}")
         provider = LocalPeftProvider(
             base_model=base_model,
-            adapter_path=str(artifact_dir),
+            adapter_path=None if is_full_hf else str(artifact_dir),
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             source_policy=resolve_model_source_policy(self.paths),
@@ -536,11 +667,49 @@ class LocalProvider:
         self._peft_providers[cache_key] = provider
         return provider
 
+    def _mlx_provider_for_variant(self, request: GenerationInput) -> LocalMLXProvider | None:
+        manifest_path = self._manifest_path(request.model_variant)
+        if manifest_path is None:
+            return None
+        cache_key = str(manifest_path)
+        if cache_key in self._mlx_providers:
+            return self._mlx_providers[cache_key]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        backend = str(manifest.get("backend", "")).strip().lower()
+        artifact_kind = str(manifest.get("artifact_kind", "") or "").strip().lower()
+        if artifact_kind == "unknown":
+            artifact_kind = ""
+        artifact_dir = Path(str(manifest.get("artifact_dir", "")).strip())
+        if artifact_kind in {"peft_adapter", "hf_full_model"}:
+            return None
+        if backend not in MLX_LM_BACKEND_ALIASES and not (
+            artifact_dir / "adapters.safetensors"
+        ).exists():
+            return None
+        base_model = self.model.strip() or str(manifest.get("base_model", "")).strip()
+        if not base_model:
+            raise RuntimeError(f"Model variant manifest lacks base_model: {manifest_path}")
+        if not artifact_dir.exists():
+            raise RuntimeError(f"Model variant artifact_dir does not exist: {artifact_dir}")
+        if not (artifact_dir / "adapters.safetensors").exists():
+            raise RuntimeError(
+                f"Model variant does not point to an MLX adapter artifact_dir: {manifest_path}"
+            )
+        provider = LocalMLXProvider(
+            base_model=base_model,
+            adapter_path=str(artifact_dir),
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            source_policy=resolve_model_source_policy(self.paths),
+        )
+        self._mlx_providers[cache_key] = provider
+        return provider
+
     def _unconfigured_error(self) -> RuntimeError:
         return RuntimeError(
             "No real local generator is configured. Set GTSM_LOCAL_GENERATOR_CMD, "
             "set GTSM_LOCAL_UNSLOTH_MODEL/GTSM_LOCAL_UNSLOTH_ADAPTER, or pass a "
-            "model_variant with a local PEFT adapter manifest. Use --allow-stub-local "
+            "model_variant with a local PEFT or MLX adapter manifest. Use --allow-stub-local "
             "only for smoke tests that intentionally use canned XML."
         )
 
@@ -551,7 +720,24 @@ class LocalProvider:
         if manifest_path is None:
             raise self._unconfigured_error()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        backend = str(manifest.get("backend", "")).strip().lower()
+        artifact_kind = str(manifest.get("artifact_kind", "") or "").strip().lower()
+        if artifact_kind == "unknown":
+            artifact_kind = ""
         artifact_dir = Path(str(manifest.get("artifact_dir", "")).strip())
+        mlx_adapter_exists = (artifact_dir / "adapters.safetensors").exists()
+        if artifact_kind in {"mlx_adapter", "mlx_full_weights"} or (
+            not artifact_kind and (backend in MLX_LM_BACKEND_ALIASES or mlx_adapter_exists)
+        ):
+            if artifact_dir.exists() and (artifact_dir / "adapters.safetensors").exists():
+                return
+            raise RuntimeError(
+                f"Model variant does not point to an MLX adapter artifact_dir: {manifest_path}"
+            )
+        if artifact_kind == "hf_full_model":
+            if artifact_dir.exists():
+                return
+            raise RuntimeError(f"Model variant artifact_dir does not exist: {artifact_dir}")
         if artifact_dir.exists() and (artifact_dir / "adapter_config.json").exists():
             return
         raise RuntimeError(
@@ -571,6 +757,11 @@ class LocalProvider:
             source_code="",
             model_variant=model_variant,
         )
+        mlx_provider = self._mlx_provider_for_variant(request)
+        if mlx_provider is not None:
+            loaded = mlx_provider.ensure_loaded()
+            return {"model_loaded": True, **loaded}
+
         peft_provider = self._peft_provider_for_variant(request)
         if peft_provider is not None:
             loaded = peft_provider.ensure_loaded()
@@ -591,6 +782,10 @@ class LocalProvider:
             )
         if self.unsloth_provider is not None:
             return self.unsloth_provider.generate_wrapper(request)
+
+        mlx_provider = self._mlx_provider_for_variant(request)
+        if mlx_provider is not None:
+            return mlx_provider.generate_wrapper(request)
 
         peft_provider = self._peft_provider_for_variant(request)
         if peft_provider is not None:

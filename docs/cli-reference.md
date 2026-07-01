@@ -54,7 +54,7 @@ Generation commands use `--provider`:
 
 | Provider | Use case | Configuration |
 | --- | --- | --- |
-| `local` | Local command, local Unsloth model, or local PEFT adapter manifest. | `GTSM_LOCAL_GENERATOR_CMD`, `GTSM_LOCAL_UNSLOTH_MODEL`, `GTSM_LOCAL_UNSLOTH_ADAPTER`, or `--model-variant`. |
+| `local` | Local command, local Unsloth model, or local PEFT/MLX/full-model variant manifest. | `GTSM_LOCAL_GENERATOR_CMD`, `GTSM_LOCAL_UNSLOTH_MODEL`, `GTSM_LOCAL_UNSLOTH_ADAPTER`, or `--model-variant`. |
 | `ollama` | Quantized GGUF model served by Ollama. | `GTSM_OLLAMA_BASE_URL`, `GTSM_OLLAMA_MODEL`, `GTSM_OLLAMA_TIMEOUT_SECONDS`, `GTSM_OLLAMA_AUTH_HEADER`. |
 | `openai` | OpenAI-compatible chat completion endpoint. | `GTSM_OPENAI_API_KEY`, optional `GTSM_OPENAI_BASE_URL`, `GTSM_OPENAI_MODEL`. |
 | `anthropic` | Anthropic messages endpoint. | `GTSM_ANTHROPIC_API_KEY`, optional `GTSM_ANTHROPIC_BASE_URL`, `GTSM_ANTHROPIC_MODEL`. |
@@ -423,7 +423,7 @@ gtsm train \
 | `--command <args...>` | Trainer command override for `--backend command`. |
 | `--corpus-jsonl <jsonl>` | Training corpus JSONL. |
 | `--artifact-format xml|udt-yaml|mixed` | Training target format. |
-| `--backend auto|axolotl|hf-sft|command` | Training backend. `auto` uses the profile. |
+| `--backend auto|axolotl|hf-sft|command|mlx-lm|mlx|mps` | Training backend. `auto` uses the profile. `mlx-lm`/`mlx`/`mps` use Apple Silicon MLX training. |
 | `--num-processes <n>` | Local process count for Axolotl/torchrun style launches. Usually one per visible GPU. |
 | `--distributed-strategy auto|ddp|fsdp|deepspeed-zero3|deepspeed-zero3-offload` | Multi-GPU strategy. |
 | `--dry-run-backend` | Build backend inputs and print metadata without launching training. |
@@ -438,6 +438,8 @@ gtsm train \
 | `--source-file <path>` | Manual source file for samples that need extra context. |
 | `--per-device-batch-size <n>` | Override profile per-device batch size. |
 | `--gradient-accumulation-steps <n>` | Override profile gradient accumulation. |
+| `--learning-rate <float>` | Override profile learning rate. Full-parameter runs usually need a lower value than LoRA. |
+| `--training-method lora|qlora|full` | Override profile training method. Existing profiles default to `lora`; 4-bit LoRA profiles run as effective QLoRA on HF/Axolotl. |
 | `--status-log <jsonl>` | Write training status events. |
 | `--status-interval-seconds <seconds>` | Interval for live status events. Defaults to `30`. |
 | `--stream-logs` | Emit incremental backend stdout/stderr chunks as status events. |
@@ -460,6 +462,20 @@ Distributed strategies have different memory and throughput tradeoffs:
 For long-context 24B tuning on three 40GB A100 GPUs, `deepspeed-zero3-offload`,
 `--no-pad-to-sequence-len`, and an efficient attention backend can be more
 practical than full model replication.
+
+Training methods are explicit:
+
+| Method | Behavior |
+| --- | --- |
+| `lora` | Freeze the base model and train PEFT or MLX LoRA adapter weights. This is the default. |
+| `qlora` | Train PEFT LoRA adapters on a 4-bit loaded HF model. Supported by HF/Axolotl, not MLX-LM. |
+| `full` | Train model weights directly. Requires non-quantized profiles; most practical on multi-GPU CUDA for larger models. |
+
+For Apple Silicon runs, install the `mps` extra in an isolated environment and
+use an `mps-*` profile, for example `--profile mps-qwen25-7b --backend auto`.
+Those profiles run through `mlx-lm` and write MLX artifacts for local generation
+with `provider=local`. MLX full mode exists, but large full-parameter MPS runs
+are not the recommended path for 24B+ models.
 
 ### `train-runs`
 
@@ -551,6 +567,32 @@ gtsm export-ollama-model \
 The training command can also do this after a successful run with
 `--post-export-quantizations`, `--post-ollama-model-name`, and
 `--post-ollama-create`.
+
+### `convert-adapter`
+
+Convert supported adapter artifacts between local formats.
+
+```bash
+gtsm convert-adapter \
+  --from mlx \
+  --to peft \
+  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --adapter-dir .gtsm-cache/runs/training/<run-id>/output \
+  --output-dir .gtsm-cache/models/converted/qwen25-7b-peft
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--from mlx` | Input adapter family. Only MLX is supported initially. |
+| `--to peft` | Output adapter family. Only PEFT is supported initially. |
+| `--base-model <id-or-path>` | Base model used to select the architecture mapping. |
+| `--adapter-dir <dir>` | MLX adapter directory with `adapter_config.json` and `adapters.safetensors`. |
+| `--output-dir <dir>` | Destination PEFT adapter directory. |
+
+MLX and PEFT adapters are not interchangeable files. Direct MLX LoRA to PEFT
+conversion is experimental and limited to known Qwen/Llama/Mistral-style
+projection modules. For broad interoperability, merge PEFT adapters into a full
+HF model and then convert/load that full model in the target runtime.
 
 ## Generation and Conversion
 
@@ -725,6 +767,8 @@ gtsm train-remote-submit \
 | `--corpus-jsonl <jsonl>` | Corpus JSONL. |
 | `--variant-id <id>` | Optional variant id. |
 | `--command <args...>` | Optional trainer command override. |
+| `--learning-rate <float>` | Optional profile learning-rate override passed to the worker. |
+| `--training-method lora|qlora|full` | Optional training-method override passed to the worker. |
 
 ### `train-remote-status`
 

@@ -15,6 +15,7 @@ import time
 import warnings
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
@@ -3329,6 +3330,11 @@ def _command_primary(command: str) -> str:
             and parts[index + 1] == "-m"
         ):
             return " ".join(parts[index : index + 3])
+        with suppress(OSError, RuntimeError):
+            if Path(part).resolve() == Path(sys.executable).resolve():
+                if index + 2 < len(parts) and parts[index + 1] == "-m":
+                    return " ".join(["python", *parts[index + 1 : index + 3]])
+                return "python"
         return part
     return ""
 
@@ -3407,6 +3413,11 @@ def _run_container_api_validation_probe(
     command: str,
     settings: ExtractionSettings,
 ) -> subprocess.CompletedProcess:
+    tokens = _command_tokens(command)
+    with suppress(OSError, RuntimeError):
+        if tokens and Path(tokens[0]).resolve() == Path(sys.executable).resolve():
+            tokens[0] = "python"
+            command = shlex.join(tokens)
     timeout_seconds = settings.container_run_timeout_seconds
     result = _run_command(
         _container_run_command(
@@ -3478,14 +3489,14 @@ def _python_api_validation_command(checks: list[str]) -> str:
             "    except Exception as exc:",
             "        errors.append({'qualified_call': qualified, 'error': repr(exc)[:240]})",
             "        continue",
-            "    if len(docs) < %d:" % _CONFIGFILE_API_DOC_LIMIT,
+            f"    if len(docs) < {_CONFIGFILE_API_DOC_LIMIT}:",
             "        try:",
             "            signature = str(inspect.signature(obj))",
             "        except Exception:",
             "            signature = ''",
             "        doc = (inspect.getdoc(obj) or '').splitlines()",
             "        docs.append({'qualified_call': qualified, 'signature': signature[:240], "
-            "'doc': (doc[0] if doc else '')[:%d]})" % _CONFIGFILE_API_DOCSTRING_LIMIT,
+            f"'doc': (doc[0] if doc else '')[:{_CONFIGFILE_API_DOCSTRING_LIMIT}]}})",
             "if docs:",
             "    print('GTSM_API_VALIDATION_OK python %d' % len(docs))",
             "else:",
@@ -3495,7 +3506,7 @@ def _python_api_validation_command(checks: list[str]) -> str:
             "raise SystemExit(0 if docs else 1)",
         ]
     )
-    return f"python -c {shlex.quote(code)}"
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
 
 def _r_string_literal(value: str) -> str:
@@ -3732,9 +3743,11 @@ def _safe_probe_environment_assignment(name: str, value: str) -> str:
     if _is_placeholder_token(value) or "@" in value or re.search(r"\{[^}]+\}", value):
         return ""
     normalized_name = name.upper()
-    if re.search(r"(?:^|_)(?:CONFIG|CONFIGFILE|CONFIG_FILE)(?:_|$)", normalized_name):
-        if not Path(value).is_absolute():
-            return ""
+    if re.search(
+        r"(?:^|_)(?:CONFIG|CONFIGFILE|CONFIG_FILE)(?:_|$)",
+        normalized_name,
+    ) and not Path(value).is_absolute():
+        return ""
     return f"{name}={shlex.quote(value)}"
 
 
@@ -3757,7 +3770,7 @@ def _record_probe_environment_prefix(record: ToolRecord, primary: str) -> str:
     for segment in _command_segments(command_text):
         tokens = _command_tokens(segment)
         assignments: list[str] = []
-        for index, token in enumerate(tokens):
+        for token in tokens:
             if _is_assignment_token(token):
                 name, value = token.split("=", 1)
                 assignment = _safe_probe_environment_assignment(name, value)
@@ -5902,13 +5915,10 @@ def _sourceforge_fallback_candidates(source_url: str) -> list[str]:
     rest: list[str] = []
     if netloc == "sourceforge.net" and len(parts) >= 3 and parts[0] == "projects":
         project = parts[1]
-        if parts[2] == "files":
-            rest = [project, *parts[3:]]
-        else:
-            rest = [project, *parts[2:]]
-    elif netloc == "downloads.sourceforge.net" and len(parts) >= 2:
-        rest = parts[1:] if parts[0] == "project" else parts
-    elif netloc.endswith(".dl.sourceforge.net") and len(parts) >= 2:
+        rest = [project, *parts[3:]] if parts[2] == "files" else [project, *parts[2:]]
+    elif (
+        netloc == "downloads.sourceforge.net" or netloc.endswith(".dl.sourceforge.net")
+    ) and len(parts) >= 2:
         rest = parts[1:] if parts[0] == "project" else parts
     if rest and rest[-1] == "download":
         rest = rest[:-1]
@@ -6913,9 +6923,7 @@ def _should_use_conda_forge_fallback(primary: dict, fallback: dict) -> bool:
             return True
         if _source_version_match_rank(fallback) > _source_version_match_rank(primary):
             return True
-        if _source_confidence_rank(fallback) > _source_confidence_rank(primary):
-            return True
-        return False
+        return _source_confidence_rank(fallback) > _source_confidence_rank(primary)
     if primary_checkout and not bool(primary.get("source_is_binary_artifact")):
         return False
     if fallback_checkout:
@@ -7731,9 +7739,9 @@ def _allows_next_line_subcommand(line: str, primary: str) -> bool:
     if stripped.endswith(("&&", "||", "|", ";")):
         return False
     primary_key = _normalized_command_key(primary)
-    if primary_key in {_normalized_command_key(command) for command in _SETUP_HELPER_COMMAND_KEYS}:
-        return False
-    return True
+    return primary_key not in {
+        _normalized_command_key(command) for command in _SETUP_HELPER_COMMAND_KEYS
+    }
 
 
 def _infer_command_signatures(command_text: str) -> tuple[str, list[str], list[str]]:

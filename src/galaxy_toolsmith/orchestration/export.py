@@ -64,7 +64,14 @@ def update_variant_ollama_metadata(
     return path
 
 
-def _is_peft_adapter(artifact_dir: Path) -> bool:
+def _is_peft_adapter(artifact_dir: Path, variant: dict | None = None) -> bool:
+    if variant is not None:
+        artifact_kind = str(variant.get("artifact_kind", "") or "").strip().lower()
+        if artifact_kind and artifact_kind != "unknown":
+            return artifact_kind == "peft_adapter"
+        backend = str(variant.get("backend", "") or "").strip().lower()
+        if backend in {"mlx-lm", "mlx", "mps"}:
+            return False
     return (artifact_dir / "adapter_config.json").exists()
 
 
@@ -295,14 +302,23 @@ def export_model_artifacts(
     notes: list[str] = []
     source_policy = resolve_model_source_policy(paths)
     quant_methods = quantizations or ["q4_k_m"]
-    is_adapter = _is_peft_adapter(artifact_dir)
+    is_adapter = _is_peft_adapter(artifact_dir, variant)
+    artifact_kind = str(variant.get("artifact_kind", "") or "").strip().lower()
+    backend = str(variant.get("backend", "") or "").strip().lower()
+    is_mlx_artifact = artifact_kind in {"mlx_adapter", "mlx_full_weights"} or backend in {
+        "mlx-lm",
+        "mlx",
+        "mps",
+    }
 
     if is_adapter:
         adapter_export_path = _copy_adapter_export(artifact_dir, export_root)
 
     if export_format in {"all", "merged"}:
         merged_dir = export_root / "merged"
-        if is_adapter:
+        if is_mlx_artifact:
+            notes.append("Merged export skipped: MLX artifacts are not PEFT/HF model directories.")
+        elif is_adapter:
             try:
                 _merge_peft_adapter(
                     variant=variant,
@@ -352,6 +368,10 @@ def export_model_artifacts(
         can_export_gguf = bool(merged_path) or not is_adapter
         if not can_export_gguf:
             notes.append("GGUF export skipped: PEFT adapter export must be merged first.")
+
+        if is_mlx_artifact:
+            can_export_gguf = False
+            notes.append("GGUF export skipped: MLX artifacts must be converted or fused outside PEFT export.")
 
         if can_export_gguf and gguf_backend in {"auto", "llama.cpp", "llamacpp"}:
             try:

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import platform
 import shutil
-import subprocess
+from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
@@ -25,15 +24,11 @@ def _has_command(name: str) -> bool:
 
 
 def _cuda_available() -> bool:
-    if _has_command("nvidia-smi"):
-        return True
-    return False
+    return bool(_has_command("nvidia-smi"))
 
 
 def _rocm_available() -> bool:
-    if _has_command("rocminfo"):
-        return True
-    return False
+    return bool(_has_command("rocminfo"))
 
 
 def _mps_available() -> bool:
@@ -41,18 +36,7 @@ def _mps_available() -> bool:
     machine = platform.machine().lower()
     if system != "darwin":
         return False
-    if machine not in {"arm64", "aarch64"}:
-        return False
-    try:
-        result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        return result.returncode == 0
-    except OSError:
-        return True
+    return machine in {"arm64", "aarch64"}
 
 
 def detect_runtime_capabilities() -> RuntimeCapabilities:

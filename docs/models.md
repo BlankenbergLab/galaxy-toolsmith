@@ -8,7 +8,8 @@ not by parameter count alone.
 ## Selection policy
 
 1. Compare model families across the same corpus slice.
-2. Fine-tune non-quantized profiles first, then export quantized variants.
+2. Fine-tune LoRA profiles first for iteration; use opt-in full profiles only
+   when the dataset, hardware, and learning-rate schedule justify it.
 3. Promote a primary default only after benchmark and operability gates pass.
 4. Treat DeepSeek, larger Qwen, and larger Mistral/Devstral variants as opt-in
    candidates until they beat the current baseline under the same gate.
@@ -19,7 +20,21 @@ not by parameter count alone.
 | --- | --- | --- | --- |
 | 4xA100 40GB | `proto-qwen25-7b`, `deepseek-r1-distill-qwen-14b`, `agentic-devstral-24b` | `baseline-mistral-24b`, `deepseek-r1-distill-qwen-32b` | Use 7B/14B for iteration; benchmark 24B/32B before default promotion. |
 | 2xA100 40GB | `proto-qwen25-7b`, `deepseek-coder-v2-lite-instruct`, `deepseek-r1-distill-qwen-14b` | `baseline-mistral-24b` with careful tuning | Prioritize memory envelope and throughput. |
-| Apple Silicon MPS | `mps-qwen25-14b` | `mps-mistral31-24b`, `mps-qwen25-32b` | CUDA-focused profiles are not the best fit on MPS. |
+| Apple Silicon MPS | `mps-qwen25-7b` | `mps-qwen25-14b`, `mps-mistral31-24b`, `mps-qwen25-32b` | Uses `mlx-lm`; CUDA-focused profiles are not the best fit on MPS. |
+
+Existing profiles default to LoRA. Explicit `training_method` values are:
+
+| Method | Best use | Notes |
+| --- | --- | --- |
+| `lora` | Default adapter tuning and local iteration. | 4-bit LoRA profiles run as effective QLoRA on HF/Axolotl. |
+| `qlora` | Explicit 4-bit PEFT adapter tuning. | CUDA/HF/Axolotl path only; not supported by MLX-LM. |
+| `full` | Full-parameter specialization on strong CUDA hosts. | Requires non-quantized profiles and much lower learning rates than LoRA. |
+
+Opt-in full profiles include `full-qwen25-7b`, `full-mistral-24b`,
+`full-deepseek-r1-distill-qwen-14b`, and
+`full-deepseek-r1-distill-qwen-32b`. Treat 64B/70B full-parameter runs as
+custom multi-GPU jobs rather than defaults; confirm the exact base model and
+memory strategy before adding a profile.
 
 ## Choose-by-goal playbook
 
@@ -68,7 +83,13 @@ scores in this run. Both still showed meaningful input/output count error.
 | `deepseek-r1-distill-qwen-14b` | Strong reasoning/coding balance with manageable A100 footprint. | Still needs tuning and benchmark evidence in this repo. | High-priority candidate for next model comparison. |
 | `deepseek-r1-distill-qwen-32b` | Higher reasoning ceiling. | Slower and heavier; likely more difficult to iterate. | Advanced candidate only if quality gains justify cost. |
 | Full `DeepSeek-R1` / `R1-Zero` | Very high reasoning potential. | Very large MoE footprint and more complex serving/training operations. | Not a practical default for the current local tuning path. |
-| `mps-*` profiles | Fit Apple Silicon development. | Not representative of CUDA A100 deployment. | Useful for local experimentation, not the main benchmark tier. |
+| `mps-*` profiles | Fit Apple Silicon development through `mlx-lm`, with 7B as the safest starting tier. | Not representative of CUDA A100 deployment. | Useful for local experimentation, not the main benchmark tier. |
+
+MLX and PEFT adapters use different formats even when filenames look similar.
+Direct MLX LoRA to PEFT conversion is available only for known
+Qwen/Llama/Mistral-style projection modules. For broader interchange, merge a
+PEFT adapter into a full HF model and then convert/load the full model in the
+target runtime.
 
 ## Export and deployment choices
 

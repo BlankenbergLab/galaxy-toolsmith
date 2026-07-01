@@ -574,6 +574,8 @@ def create_app(
         corpus_jsonl_path = str(payload.get("corpus_jsonl_path", "")).strip()
         variant_id = str(payload.get("variant_id", "")).strip()
         trainer_command = payload.get("trainer_command", [])
+        learning_rate = payload.get("learning_rate")
+        training_method = str(payload.get("training_method", "") or "").strip() or None
         if not profile_name:
             raise HTTPException(status_code=400, detail="profile_name_required")
         if not dataset_manifest_path:
@@ -589,6 +591,8 @@ def create_app(
             corpus_jsonl_path=corpus_jsonl_path,
             variant_id=variant_id,
             trainer_command=[str(item) for item in trainer_command],
+            learning_rate=float(learning_rate) if learning_rate is not None else None,
+            training_method=training_method,
         )
         _emit_status(
             {

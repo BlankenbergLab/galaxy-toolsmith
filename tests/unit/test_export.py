@@ -101,6 +101,40 @@ def test_export_model_artifacts_merges_peft_adapter(
     assert (Path(result.adapter_export_path) / "adapter_model.safetensors").exists()
 
 
+def test_export_model_artifacts_skips_peft_merge_for_mlx_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    artifact_dir = paths.models_root / "artifacts" / "variant-mlx"
+    artifact_dir.mkdir(parents=True)
+    (paths.models_root / "variants").mkdir(parents=True)
+    (artifact_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (artifact_dir / "adapters.safetensors").write_text("adapter", encoding="utf-8")
+    (paths.models_root / "variants" / "variant-mlx.manifest.json").write_text(
+        ModelVariantManifest(
+            variant_id="variant-mlx",
+            base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+            backend="mlx-lm",
+            artifact_kind="mlx_adapter",
+            artifact_dir=str(artifact_dir),
+        ).to_json(),
+        encoding="utf-8",
+    )
+
+    def fail_merge(*args, **kwargs) -> None:
+        raise AssertionError("MLX artifacts must not use PEFT merge")
+
+    monkeypatch.setattr(export_mod, "_merge_peft_adapter", fail_merge)
+
+    result = export_model_artifacts(paths=paths, variant_id="variant-mlx", export_format="merged")
+
+    assert result.status == "partial"
+    assert result.merged_path == ""
+    assert any("MLX artifacts" in note for note in result.notes)
+
+
 def test_export_model_artifacts_reports_partial_when_gguf_backend_missing(
     tmp_path: Path,
     monkeypatch,

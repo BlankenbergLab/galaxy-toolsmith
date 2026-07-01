@@ -74,6 +74,21 @@ make train PROFILE=agentic-devstral-24b
 
 If you already have a compatible conda environment active, use `make install-active` instead of creating `.conda/gtsm`.
 
+On Apple Silicon, create an isolated MPS/MLX environment and use the `mps-*`
+profiles:
+
+```bash
+mamba create -y -p .conda/gtsm-mps python=3.12 pip
+.conda/gtsm-mps/bin/python -m pip install -e '.[mps,dev]'
+.conda/gtsm-mps/bin/gtsm train --profile mps-qwen25-7b --dry-run-backend
+```
+
+Training profiles default to LoRA. Use `--training-method qlora` for explicit
+4-bit PEFT adapter tuning on HF/Axolotl, or `--training-method full` with a
+non-quantized profile for full-parameter tuning. Full large-model training is
+intended mainly for multi-GPU CUDA hosts; MLX full mode is exposed but is not
+the recommended path for 24B+ Apple Silicon runs.
+
 The Linux conda environment includes `apptainer`, `squashfuse`, and `libfuse3`.
 `apptainer` provides the Singularity-compatible container runtime, `squashfuse`
 mounts cached SIF images directly, and `libfuse3` provides the env-local
@@ -170,6 +185,14 @@ gtsm train-artifacts-fetch --server-url http://127.0.0.1:8765 --job-id <job-id> 
 - Set `GTSM_LOCAL_UNSLOTH_MODEL` to enable local unsloth inference in `--provider local`
 - Optionally set `GTSM_LOCAL_UNSLOTH_ADAPTER` to load a LoRA adapter path
 - `GTSM_LOCAL_GENERATOR_CMD` still takes precedence when set (external command mode)
+
+## Adapter conversion
+- PEFT and MLX adapters are separate artifact formats.
+- `gtsm convert-adapter --from mlx --to peft ...` can convert supported MLX
+  LoRA adapters for known Qwen/Llama/Mistral-style models.
+- Direct adapter conversion is experimental; the most reliable interchange path
+  is still merge-to-full-model, then convert/load the full model in the target
+  runtime.
 
 ## Documentation
 - Build docs locally:

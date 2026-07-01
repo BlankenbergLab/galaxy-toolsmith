@@ -91,6 +91,8 @@ def create_training_job(
     corpus_jsonl_path: str,
     variant_id: str,
     trainer_command: list[str],
+    learning_rate: float | None = None,
+    training_method: str | None = None,
 ) -> DistributedJob:
     job_id = f"job-{uuid.uuid4().hex[:12]}"
     task_id = f"task-{uuid.uuid4().hex[:12]}"
@@ -100,6 +102,8 @@ def create_training_job(
         "corpus_jsonl_path": corpus_jsonl_path,
         "variant_id": variant_id,
         "trainer_command": trainer_command,
+        "learning_rate": learning_rate,
+        "training_method": training_method,
     }
     task = DistributedTask(
         task_id=task_id,

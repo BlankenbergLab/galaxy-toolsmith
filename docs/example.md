@@ -177,6 +177,21 @@ gtsm train-remote-submit \
   --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl
 ```
 
+For an opt-in full-parameter run on this class of host, use a `full-*` profile
+or override the method and learning rate explicitly:
+
+```bash
+gtsm train \
+  --profile full-mistral-24b \
+  --training-method full \
+  --learning-rate 2e-5 \
+  --backend axolotl \
+  --num-processes 4 \
+  --distributed-strategy auto \
+  --no-pad-to-sequence-len \
+  --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl
+```
+
 ### Start workers
 
 Open separate shells (or managed services) and run:

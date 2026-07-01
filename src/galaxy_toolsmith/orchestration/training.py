@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from galaxy_toolsmith.inference.source_context import (
     SourceContextSettings,
     build_source_context_from_record,
 )
-from galaxy_toolsmith.models.training import TrainingProfile
+from galaxy_toolsmith.models.training import TrainingProfile, normalize_training_method
 from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.runtime.capabilities import RuntimeCapabilities, detect_runtime_capabilities
 from galaxy_toolsmith.runtime.model_source import (
@@ -151,6 +152,53 @@ DISTRIBUTED_TRAINING_STRATEGIES = {
     "auto",
 }
 
+MLX_LM_BACKEND_ALIASES = {"mlx-lm", "mlx", "mps"}
+KBIT_QUANTIZATIONS = {"4bit", "int4", "bnb-4bit", "8bit", "int8", "bnb-8bit"}
+FOUR_BIT_QUANTIZATIONS = {"4bit", "int4", "bnb-4bit"}
+
+
+def _normalize_quantization(profile: TrainingProfile) -> str:
+    return profile.quantization.strip().lower()
+
+
+def _effective_training_method(profile: TrainingProfile, selected_backend: str | None = None) -> str:
+    method = normalize_training_method(profile.training_method)
+    quantization = _normalize_quantization(profile)
+    backend = str(selected_backend or profile.backend).strip().lower()
+    if method == "lora" and quantization in FOUR_BIT_QUANTIZATIONS and backend not in MLX_LM_BACKEND_ALIASES:
+        return "qlora"
+    return method
+
+
+def _validate_training_method(profile: TrainingProfile, selected_backend: str | None = None) -> str:
+    method = normalize_training_method(profile.training_method)
+    effective = _effective_training_method(profile, selected_backend)
+    quantization = _normalize_quantization(profile)
+    backend = str(selected_backend or profile.backend).strip().lower()
+    if method == "full" and quantization in KBIT_QUANTIZATIONS:
+        raise ValueError("training_method=full requires quantization=none.")
+    if method == "qlora":
+        if quantization not in FOUR_BIT_QUANTIZATIONS:
+            raise ValueError("training_method=qlora requires a 4-bit quantized profile.")
+        if backend in MLX_LM_BACKEND_ALIASES:
+            raise ValueError("training_method=qlora is not supported by the mlx-lm backend.")
+    if backend in MLX_LM_BACKEND_ALIASES and effective == "qlora":
+        raise ValueError("QLoRA is not supported by the mlx-lm backend.")
+    return effective
+
+
+def _artifact_kind_for_backend(*, backend: str, effective_training_method: str) -> str:
+    normalized_backend = backend.strip().lower()
+    if normalized_backend in MLX_LM_BACKEND_ALIASES:
+        return "mlx_full_weights" if effective_training_method == "full" else "mlx_adapter"
+    if normalized_backend not in {HFSFTTrainingBackend.name, AxolotlTrainingBackend.name}:
+        return "unknown"
+    if effective_training_method == "full":
+        return "hf_full_model"
+    if effective_training_method in {"lora", "qlora"}:
+        return "peft_adapter"
+    return "unknown"
+
 
 def _normalize_distributed_strategy(strategy: str | None) -> str:
     normalized = str(strategy or "").strip().lower().replace("_", "-")
@@ -216,8 +264,10 @@ class TrainingProfileOverrides:
     attn_implementation: str | None = None
     per_device_batch_size: int | None = None
     gradient_accumulation_steps: int | None = None
+    learning_rate: float | None = None
+    training_method: str | None = None
 
-    def to_dict(self) -> dict[str, int | bool | str]:
+    def to_dict(self) -> dict[str, int | float | bool | str]:
         return {
             key: value
             for key, value in {
@@ -226,6 +276,8 @@ class TrainingProfileOverrides:
                 "attn_implementation": self.attn_implementation,
                 "per_device_batch_size": self.per_device_batch_size,
                 "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "learning_rate": self.learning_rate,
+                "training_method": self.training_method,
             }.items()
             if value is not None
         }
@@ -294,6 +346,14 @@ def _positive_override(value: int | None, name: str) -> int | None:
     return value
 
 
+def _positive_float_override(value: float | None, name: str) -> float | None:
+    if value is None:
+        return None
+    if value <= 0:
+        raise ValueError(f"--{name.replace('_', '-')} must be greater than 0.")
+    return value
+
+
 def _apply_training_profile_overrides(
     profile: TrainingProfile,
     overrides: TrainingProfileOverrides | None,
@@ -309,6 +369,12 @@ def _apply_training_profile_overrides(
         overrides.gradient_accumulation_steps,
         "gradient_accumulation_steps",
     )
+    learning_rate = _positive_float_override(overrides.learning_rate, "learning_rate")
+    training_method = (
+        normalize_training_method(overrides.training_method)
+        if overrides.training_method is not None
+        else profile.training_method
+    )
     return replace(
         profile,
         max_seq_length=max_seq_length or profile.max_seq_length,
@@ -321,6 +387,8 @@ def _apply_training_profile_overrides(
         per_device_batch_size=per_device_batch_size or profile.per_device_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps
         or profile.gradient_accumulation_steps,
+        learning_rate=learning_rate or profile.learning_rate,
+        training_method=training_method,
     )
 
 
@@ -1216,15 +1284,16 @@ def _build_sft_trainer(
     train_dataset: object,
     tokenizer: object,
     args: object,
-    peft_config: object,
+    peft_config: object | None,
     profile: TrainingProfile,
 ) -> object:
     kwargs = {
         "model": model,
         "train_dataset": train_dataset,
         "args": args,
-        "peft_config": peft_config,
     }
+    if peft_config is not None:
+        kwargs["peft_config"] = peft_config
     if _accepts_kwarg(sft_trainer_cls, "tokenizer"):
         kwargs["tokenizer"] = tokenizer
     elif _accepts_kwarg(sft_trainer_cls, "processing_class"):
@@ -1303,10 +1372,16 @@ class HFSFTTrainingBackend(TrainingBackend):
         )
         started_at = utc_now_iso()
         if dry_run_backend:
+            effective_method = _validate_training_method(profile, self.name)
             return BackendResult(
                 status="dry-run",
                 metrics={
                     "backend": self.name,
+                    "effective_training_method": effective_method,
+                    "artifact_kind": _artifact_kind_for_backend(
+                        backend=self.name,
+                        effective_training_method=effective_method,
+                    ),
                     "samples": len(samples),
                     "training_data_diagnostics": training_data_diagnostics,
                     "progress": make_progress_snapshot(
@@ -1318,14 +1393,8 @@ class HFSFTTrainingBackend(TrainingBackend):
             )
 
         try:
-            from datasets import Dataset
-            from peft import LoraConfig
-
-            try:
-                from peft import prepare_model_for_kbit_training
-            except ImportError:
-                prepare_model_for_kbit_training = None
             import torch
+            from datasets import Dataset
             from transformers import (
                 AutoModelForCausalLM,
                 AutoTokenizer,
@@ -1345,8 +1414,24 @@ class HFSFTTrainingBackend(TrainingBackend):
                 SFTConfig = None
         except Exception as error:
             raise RuntimeError(
-                "HF SFT backend requires optional training dependencies: datasets, transformers, peft, trl."
+                "HF SFT backend requires optional training dependencies: datasets, transformers, trl."
             ) from error
+
+        effective_method = _validate_training_method(profile, self.name)
+        LoraConfig = None
+        prepare_model_for_kbit_training = None
+        if effective_method in {"lora", "qlora"}:
+            try:
+                from peft import LoraConfig
+
+                try:
+                    from peft import prepare_model_for_kbit_training
+                except ImportError:
+                    prepare_model_for_kbit_training = None
+            except Exception as error:
+                raise RuntimeError(
+                    "HF SFT LoRA/QLoRA training requires optional dependency: peft."
+                ) from error
 
         if distributed_context.world_size > 1 and _cuda_available(torch):
             set_device = getattr(torch.cuda, "set_device", None)
@@ -1391,19 +1476,20 @@ class HFSFTTrainingBackend(TrainingBackend):
             model.gradient_checkpointing_enable()
         if hasattr(model, "config") and hasattr(model.config, "use_cache"):
             model.config.use_cache = False
-        kbit_quantizations = {"4bit", "int4", "bnb-4bit", "8bit", "int8", "bnb-8bit"}
-        if profile.quantization.strip().lower() in kbit_quantizations and (
+        if _normalize_quantization(profile) in KBIT_QUANTIZATIONS and (
             prepare_model_for_kbit_training is not None
         ):
             model = prepare_model_for_kbit_training(model)
 
-        peft_config = LoraConfig(
-            r=profile.lora_rank,
-            lora_alpha=profile.lora_alpha,
-            lora_dropout=profile.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
+        peft_config = None
+        if effective_method in {"lora", "qlora"}:
+            peft_config = LoraConfig(
+                r=profile.lora_rank,
+                lora_alpha=profile.lora_alpha,
+                lora_dropout=profile.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
         uses_legacy_sft_kwargs = _accepts_kwarg(SFTTrainer, "dataset_text_field") or _accepts_kwarg(
             SFTTrainer, "max_seq_length"
         )
@@ -1440,6 +1526,11 @@ class HFSFTTrainingBackend(TrainingBackend):
             status="completed",
             metrics={
                 "backend": self.name,
+                "effective_training_method": effective_method,
+                "artifact_kind": _artifact_kind_for_backend(
+                    backend=self.name,
+                    effective_training_method=effective_method,
+                ),
                 "samples": len(samples),
                 "training_data_diagnostics": training_data_diagnostics,
                 "global_step": int(getattr(train_result, "global_step", 0) or 0),
@@ -1581,6 +1672,7 @@ def _axolotl_config(
     quantization = profile.quantization.strip().lower()
     is_4bit = quantization in {"4bit", "int4", "bnb-4bit"}
     is_8bit = quantization in {"8bit", "int8", "bnb-8bit"}
+    effective_method = _validate_training_method(profile, AxolotlTrainingBackend.name)
     strategy = _normalize_distributed_strategy(distributed_strategy)
     config = {
         "base_model": profile.base_model,
@@ -1598,11 +1690,6 @@ def _axolotl_config(
         "sequence_len": profile.max_seq_length,
         "sample_packing": False,
         "pad_to_sequence_len": profile.pad_to_sequence_len,
-        "adapter": "qlora" if is_4bit or is_8bit else "lora",
-        "lora_r": profile.lora_rank,
-        "lora_alpha": profile.lora_alpha,
-        "lora_dropout": profile.lora_dropout,
-        "lora_target_linear": True,
         "micro_batch_size": profile.per_device_batch_size,
         "gradient_accumulation_steps": profile.gradient_accumulation_steps,
         "num_epochs": profile.epochs,
@@ -1619,6 +1706,16 @@ def _axolotl_config(
         "wandb_mode": "disabled",
         "strict": False,
     }
+    if effective_method in {"lora", "qlora"}:
+        config.update(
+            {
+                "adapter": "qlora" if effective_method == "qlora" else "lora",
+                "lora_r": profile.lora_rank,
+                "lora_alpha": profile.lora_alpha,
+                "lora_dropout": profile.lora_dropout,
+                "lora_target_linear": True,
+            }
+        )
     if profile.attn_implementation:
         config["attn_implementation"] = profile.attn_implementation
     if strategy == "fsdp":
@@ -1714,6 +1811,7 @@ class AxolotlTrainingBackend(TrainingBackend):
         stderr_log_path = run_dir / "axolotl" / "stderr.log"
         source_policy = resolve_model_source_policy(paths)
         compat_sitecustomize_path = _write_axolotl_runtime_compat(run_dir, profile)
+        effective_method = _validate_training_method(profile, self.name)
         config = _axolotl_config(
             profile=profile,
             train_jsonl_path=train_jsonl_path,
@@ -1727,6 +1825,11 @@ class AxolotlTrainingBackend(TrainingBackend):
         command = _axolotl_command(config_path=config_path, num_processes=num_processes)
         metrics = {
             "backend": self.name,
+            "effective_training_method": effective_method,
+            "artifact_kind": _artifact_kind_for_backend(
+                backend=self.name,
+                effective_training_method=effective_method,
+            ),
             "samples": len(samples),
             "dataset_path": str(train_jsonl_path),
             "config_path": str(config_path),
@@ -1892,11 +1995,307 @@ class AxolotlTrainingBackend(TrainingBackend):
         )
 
 
+def _mlx_lm_training_iterations(profile: TrainingProfile, sample_count: int) -> int:
+    batch_units = max(1, profile.per_device_batch_size * profile.gradient_accumulation_steps)
+    return max(1, math.ceil(max(1, sample_count) * max(1, profile.epochs) / batch_units))
+
+
+def _mlx_lm_dataset_records(samples: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        {
+            "prompt": str(sample.get("instruction", "")),
+            "completion": str(sample.get("output", "")),
+        }
+        for sample in samples
+    ]
+
+
+def _write_mlx_lm_dataset(data_dir: Path, samples: list[dict[str, str]]) -> dict[str, Path]:
+    records = _mlx_lm_dataset_records(samples)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    train_path = _write_jsonl(data_dir / "train.jsonl", records)
+    valid_count = min(max(1, len(records) // 20), 100)
+    valid_path = _write_jsonl(data_dir / "valid.jsonl", records[:valid_count])
+    return {"data_dir": data_dir, "train_path": train_path, "valid_path": valid_path}
+
+
+def _mlx_lm_config(
+    *,
+    profile: TrainingProfile,
+    data_dir: Path,
+    output_dir: Path,
+    sample_count: int,
+) -> dict:
+    iters = _mlx_lm_training_iterations(profile, sample_count)
+    effective_method = _validate_training_method(profile, MLXLMTrainingBackend.name)
+    uses_mistral_common = _profile_uses_mistral_common_tokenizer(profile)
+    config = {
+        "model": profile.base_model,
+        "train": True,
+        "fine_tune_type": effective_method,
+        "data": str(data_dir),
+        "adapter_path": str(output_dir),
+        "seed": profile.seed,
+        "num_layers": 0 if effective_method == "full" else 16,
+        "batch_size": profile.per_device_batch_size,
+        "iters": iters,
+        "val_batches": -1,
+        "learning_rate": profile.learning_rate,
+        "steps_per_report": max(1, min(10, iters)),
+        "steps_per_eval": max(1, iters),
+        "save_every": max(1, iters),
+        "max_seq_length": profile.max_seq_length,
+        "grad_checkpoint": True,
+        "grad_accumulation_steps": profile.gradient_accumulation_steps,
+        "mask_prompt": not uses_mistral_common,
+        "optimizer": "adamw",
+        "trust_remote_code": True,
+    }
+    if uses_mistral_common:
+        config["tokenizer_config"] = {"mode": "finetuning"}
+    if effective_method == "lora":
+        config["lora_parameters"] = {
+            "rank": profile.lora_rank,
+            "dropout": profile.lora_dropout,
+            "scale": profile.lora_alpha,
+        }
+    return config
+
+
+def _mlx_lm_command(config_path: Path) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "galaxy_toolsmith.runtime.mlx_lm_lora",
+        "--config",
+        str(config_path),
+    ]
+
+
+class MLXLMTrainingBackend(TrainingBackend):
+    name = "mlx-lm"
+
+    def run(
+        self,
+        paths: WorkspacePaths,
+        profile: TrainingProfile,
+        run_dir: Path,
+        checkpoints_dir: Path,
+        output_dir: Path,
+        command_override: list[str] | None,
+        corpus_jsonl_path: Path,
+        num_processes: int = 1,
+        dry_run_backend: bool = False,
+        distributed_context: DistributedTrainingContext = DEFAULT_DISTRIBUTED_CONTEXT,
+        metrics_path: Path | None = None,
+        base_metrics: dict | None = None,
+        status_log_path: Path | None = None,
+        status_interval_seconds: float = 30.0,
+        stream_logs: bool = False,
+        log_tail_lines: int = 40,
+        distributed_strategy: str = "ddp",
+        artifact_format: str = ARTIFACT_FORMAT_XML,
+        source_context_settings: SourceContextSettings | None = None,
+    ) -> BackendResult:
+        del checkpoints_dir, command_override, distributed_context, distributed_strategy
+        if num_processes != 1:
+            raise ValueError("mlx-lm training currently supports --num-processes 1 only.")
+        started_at = utc_now_iso()
+        samples, training_data_diagnostics = _load_instruction_records_with_diagnostics(
+            corpus_jsonl_path,
+            profile,
+            repo_root=paths.repo_root,
+            artifact_format=artifact_format,
+            source_context_settings=source_context_settings,
+        )
+        mlx_dir = run_dir / "mlx-lm"
+        dataset_paths = _write_mlx_lm_dataset(mlx_dir / "data", samples)
+        config_path = mlx_dir / "lora.yml"
+        stdout_log_path = mlx_dir / "stdout.log"
+        stderr_log_path = mlx_dir / "stderr.log"
+        source_policy = resolve_model_source_policy(paths)
+        config = _mlx_lm_config(
+            profile=profile,
+            data_dir=dataset_paths["data_dir"],
+            output_dir=output_dir,
+            sample_count=len(samples),
+        )
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        command = _mlx_lm_command(config_path)
+        effective_method = _validate_training_method(profile, self.name)
+        metrics = {
+            "backend": self.name,
+            "effective_training_method": effective_method,
+            "artifact_kind": _artifact_kind_for_backend(
+                backend=self.name,
+                effective_training_method=effective_method,
+            ),
+            "samples": len(samples),
+            "data_dir": str(dataset_paths["data_dir"]),
+            "train_jsonl_path": str(dataset_paths["train_path"]),
+            "valid_jsonl_path": str(dataset_paths["valid_path"]),
+            "config_path": str(config_path),
+            "command": command,
+            "stdout_log_path": str(stdout_log_path),
+            "stderr_log_path": str(stderr_log_path),
+            "adapter_path": str(output_dir),
+            "artifact_dir": str(output_dir),
+            "model_source_policy": source_policy.to_dict(),
+            "training_data_diagnostics": training_data_diagnostics,
+        }
+        if dry_run_backend:
+            return BackendResult(
+                status="dry-run",
+                metrics={
+                    **metrics,
+                    "progress": make_progress_snapshot(
+                        started_at=started_at,
+                        completed_units=0,
+                        total_units=0,
+                    ).to_dict(),
+                },
+            )
+
+        stdout_log_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess_env = merged_model_source_environment(None, source_policy)
+        status_interval_seconds = max(0.1, float(status_interval_seconds))
+        log_tail_lines = max(0, int(log_tail_lines))
+        last_status_emit = 0.0
+        stdout_offset = 0
+        stderr_offset = 0
+        last_stdout_line = ""
+        last_stderr_line = ""
+        with (
+            stdout_log_path.open("w", encoding="utf-8") as stdout_handle,
+            stderr_log_path.open("w", encoding="utf-8") as stderr_handle,
+        ):
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                cwd=paths.repo_root,
+                env=subprocess_env,
+            )
+            emit_status(
+                {
+                    "status": "training-backend-started",
+                    "run_id": run_dir.name,
+                    "backend": self.name,
+                    "pid": process.pid,
+                    "command": command,
+                    "config_path": str(config_path),
+                },
+                status_log_path=status_log_path,
+            )
+            while True:
+                returncode = process.poll()
+                done = returncode is not None
+                stdout_handle.flush()
+                stderr_handle.flush()
+                stdout_offset, stdout_chunk, stdout_last = _read_new_log_lines(
+                    stdout_log_path, stdout_offset, log_tail_lines
+                )
+                stderr_offset, stderr_chunk, stderr_last = _read_new_log_lines(
+                    stderr_log_path, stderr_offset, log_tail_lines
+                )
+                if stdout_last:
+                    last_stdout_line = stdout_last
+                if stderr_last:
+                    last_stderr_line = stderr_last
+                if stream_logs and (stdout_chunk or stderr_chunk):
+                    emit_status(
+                        {
+                            "status": "training-log",
+                            "run_id": run_dir.name,
+                            "backend": self.name,
+                            "pid": process.pid,
+                            "stdout": stdout_chunk,
+                            "stderr": stderr_chunk,
+                            "stdout_log_path": str(stdout_log_path),
+                            "stderr_log_path": str(stderr_log_path),
+                        },
+                        status_log_path=status_log_path,
+                    )
+                run_status = "running"
+                completed_units = 0
+                if done:
+                    run_status = "completed" if returncode == 0 else "failed"
+                    completed_units = 1 if returncode == 0 else 0
+                progress = make_progress_snapshot(
+                    started_at=started_at,
+                    completed_units=completed_units,
+                    total_units=1,
+                ).to_dict()
+                live_metrics = {
+                    **metrics,
+                    "status": run_status,
+                    "pid": process.pid,
+                    "process_running": not done,
+                    "returncode": returncode,
+                    "progress": progress,
+                    "last_stdout_line": last_stdout_line,
+                    "last_stderr_line": last_stderr_line,
+                }
+                _write_live_training_metrics(metrics_path, base_metrics, live_metrics)
+                now = time.monotonic()
+                if done or now - last_status_emit >= status_interval_seconds:
+                    emit_status(
+                        {
+                            "status": "training-progress",
+                            "run_id": run_dir.name,
+                            "run_status": run_status,
+                            "backend": self.name,
+                            "pid": process.pid,
+                            "progress": progress,
+                            "stdout_log_path": str(stdout_log_path),
+                            "stderr_log_path": str(stderr_log_path),
+                            "last_stdout_line": last_stdout_line,
+                            "last_stderr_line": last_stderr_line,
+                            "process_running": not done,
+                        },
+                        status_log_path=status_log_path,
+                    )
+                    last_status_emit = now
+                if done:
+                    break
+                time.sleep(min(status_interval_seconds, 1.0))
+
+        stdout_tail = _tail_file(stdout_log_path, 120)
+        stderr_tail = _tail_file(stderr_log_path, 120)
+        if returncode != 0:
+            raise subprocess.CalledProcessError(
+                int(returncode or 1),
+                command,
+                output=stdout_tail,
+                stderr=stderr_tail,
+            )
+        return BackendResult(
+            status="completed",
+            metrics={
+                **metrics,
+                "stdout": stdout_tail,
+                "stderr": stderr_tail,
+                "pid": process.pid,
+                "process_running": False,
+                "returncode": returncode,
+                "last_stdout_line": _last_nonempty_line(stdout_log_path),
+                "last_stderr_line": _last_nonempty_line(stderr_log_path),
+                "progress": make_progress_snapshot(
+                    started_at=started_at,
+                    completed_units=1,
+                    total_units=1,
+                ).to_dict(),
+            },
+        )
+
+
 def _supports_intended_backend(profile: TrainingProfile, capabilities: RuntimeCapabilities) -> bool:
-    backend = profile.backend.lower()
+    backend = profile.backend.strip().lower()
     if backend in {"axolotl", "cuda", "rocm"}:
         return capabilities.cuda_available or capabilities.rocm_available
-    if backend in {"mlx", "mlx-lm", "mps"}:
+    if backend in MLX_LM_BACKEND_ALIASES:
         return capabilities.mps_available
     return backend in {"cpu", "hf-sft"}
 
@@ -1909,7 +2308,9 @@ def _select_backend(
     dry_run_backend: bool = False,
 ) -> BackendSelection:
     requested_backend = (backend_override or "auto").strip().lower()
-    intended_backend = profile.backend if requested_backend == "auto" else requested_backend
+    intended_backend = (
+        str(profile.backend).strip().lower() if requested_backend == "auto" else requested_backend
+    )
     if (
         command_override
         or (requested_backend in {"auto", "command"} and profile.default_command)
@@ -1940,6 +2341,14 @@ def _select_backend(
             selected_backend=HFSFTTrainingBackend.name,
             fallback_reason="intended_backend=axolotl unsupported on this runtime; falling back to hf-sft",
             intended_methodology_supported=False,
+        )
+    if intended_backend in MLX_LM_BACKEND_ALIASES:
+        return BackendSelection(
+            backend=MLXLMTrainingBackend(),
+            intended_backend=intended_backend,
+            selected_backend=MLXLMTrainingBackend.name,
+            fallback_reason="",
+            intended_methodology_supported=supported_profile,
         )
     if intended_backend in {"hf-sft", "cpu"}:
         return BackendSelection(
@@ -2023,6 +2432,10 @@ def _hf_sft_distributed_launch_command(
                 str(overrides.gradient_accumulation_steps),
             ]
         )
+    if overrides.learning_rate is not None:
+        command.extend(["--learning-rate", str(overrides.learning_rate)])
+    if overrides.training_method is not None:
+        command.extend(["--training-method", overrides.training_method])
     source_context_settings = (source_context_settings or SourceContextSettings()).normalized()
     if source_context_settings.mode != "none":
         command.extend(["--source-context-mode", source_context_settings.mode])
@@ -2100,6 +2513,14 @@ def run_training(
         dry_run_backend=dry_run_backend,
     )
     backend = backend_selection.backend
+    effective_training_method = _validate_training_method(
+        profile,
+        backend_selection.selected_backend,
+    )
+    artifact_kind = _artifact_kind_for_backend(
+        backend=backend_selection.selected_backend,
+        effective_training_method=effective_training_method,
+    )
     effective_distributed_strategy = _resolve_distributed_strategy(
         profile=profile,
         requested_strategy=distributed_strategy,
@@ -2114,6 +2535,9 @@ def run_training(
         provider=profile.provider,
         base_model=profile.base_model,
         quantization=profile.quantization,
+        training_method=profile.training_method,
+        effective_training_method=effective_training_method,
+        artifact_kind=artifact_kind,
         dataset_manifest_path=str(dataset_manifest_path),
         dataset_id=dataset_id,
         command=command,
@@ -2134,6 +2558,9 @@ def run_training(
         "intended_methodology_supported": backend_selection.intended_methodology_supported,
         "backend_fallback_reason": backend_selection.fallback_reason,
         "source_quantization": profile.quantization,
+        "requested_training_method": profile.training_method,
+        "effective_training_method": effective_training_method,
+        "artifact_kind": artifact_kind,
         "artifact_format": artifact_format,
         "source_context": source_context_settings.to_dict(),
         "requested_distributed_strategy": distributed_strategy or profile.distributed_strategy,
@@ -2336,6 +2763,9 @@ def run_training(
         provider=profile.provider,
         skills_profile=profile.skills_profile,
         backend=backend_selection.selected_backend,
+        training_method=profile.training_method,
+        effective_training_method=effective_training_method,
+        artifact_kind=artifact_kind,
         artifact_dir=str(output_dir),
     )
     variant_path = variants_dir / f"{resolved_variant_id}.manifest.json"

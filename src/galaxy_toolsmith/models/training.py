@@ -4,6 +4,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+TRAINING_METHODS = {"lora", "qlora", "full"}
+
 
 @dataclass(frozen=True)
 class TrainingProfile:
@@ -22,6 +24,7 @@ class TrainingProfile:
     gradient_accumulation_steps: int = 1
     distributed_strategy: str = "ddp"
     learning_rate: float = 2e-4
+    training_method: str = "lora"
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.0
@@ -136,6 +139,30 @@ DEFAULT_TRAINING_PROFILES = [
         gradient_accumulation_steps=4,
     ),
     TrainingProfile(
+        name="mps-qwen25-7b",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=8192,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=1,
+    ),
+    TrainingProfile(
+        name="mps-devstral-24b",
+        base_model="mistralai/Devstral-Small-2505",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=8192,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=2,
+    ),
+    TrainingProfile(
         name="mps-qwen25-14b",
         base_model="Qwen/Qwen2.5-Coder-14B-Instruct",
         provider="local",
@@ -172,6 +199,66 @@ DEFAULT_TRAINING_PROFILES = [
         gradient_accumulation_steps=4,
     ),
     TrainingProfile(
+        name="full-qwen25-7b",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=8192,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=2,
+        distributed_strategy="auto",
+        learning_rate=2e-5,
+        training_method="full",
+    ),
+    TrainingProfile(
+        name="full-mistral-24b",
+        base_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        provider="local",
+        quantization="none",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=8192,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=4,
+        distributed_strategy="auto",
+        learning_rate=2e-5,
+        training_method="full",
+    ),
+    TrainingProfile(
+        name="full-deepseek-r1-distill-qwen-14b",
+        base_model="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        provider="local",
+        quantization="none",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=8192,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=4,
+        distributed_strategy="auto",
+        learning_rate=2e-5,
+        training_method="full",
+    ),
+    TrainingProfile(
+        name="full-deepseek-r1-distill-qwen-32b",
+        base_model="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+        provider="local",
+        quantization="none",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=4096,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=8,
+        distributed_strategy="auto",
+        learning_rate=2e-5,
+        training_method="full",
+    ),
+    TrainingProfile(
         name="external-api-reference",
         base_model="unset",
         provider="external",
@@ -188,6 +275,16 @@ def write_default_training_profiles(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
+
+
+def normalize_training_method(value: str | None) -> str:
+    normalized = str(value or "lora").strip().lower().replace("_", "-")
+    if not normalized:
+        normalized = "lora"
+    if normalized not in TRAINING_METHODS:
+        choices = ", ".join(sorted(TRAINING_METHODS))
+        raise ValueError(f"Unsupported training_method '{value}'. Expected one of: {choices}.")
+    return normalized
 
 
 def load_training_profile(path: Path, profile_name: str) -> TrainingProfile:
@@ -210,6 +307,7 @@ def load_training_profile(path: Path, profile_name: str) -> TrainingProfile:
                 gradient_accumulation_steps=int(profile.get("gradient_accumulation_steps", 1)),
                 distributed_strategy=str(profile.get("distributed_strategy", "ddp")),
                 learning_rate=float(profile.get("learning_rate", 2e-4)),
+                training_method=normalize_training_method(profile.get("training_method", "lora")),
                 lora_rank=int(profile.get("lora_rank", 16)),
                 lora_alpha=int(profile.get("lora_alpha", 32)),
                 lora_dropout=float(profile.get("lora_dropout", 0.0)),

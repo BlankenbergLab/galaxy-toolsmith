@@ -11,7 +11,7 @@ import galaxy_toolsmith.orchestration.training as training_mod
 from galaxy_toolsmith.core.manifests import TrainingRunManifest
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.source_context import source_context_settings
-from galaxy_toolsmith.models.training import TrainingProfile
+from galaxy_toolsmith.models.training import TrainingProfile, load_training_profile
 from galaxy_toolsmith.orchestration.training import (
     TrainingProfileOverrides,
     _apply_training_profile_overrides,
@@ -27,16 +27,19 @@ from galaxy_toolsmith.orchestration.training import (
     _hf_sft_distributed_launch_command,
     _load_instruction_records,
     _load_instruction_records_with_diagnostics,
+    _mlx_lm_config,
     _model_load_kwargs,
     _read_new_log_lines,
     _record_training_help_text,
     _select_backend,
+    _validate_training_method,
     _write_axolotl_runtime_compat,
     get_local_training_run,
     list_local_training_runs,
     run_training,
 )
 from galaxy_toolsmith.runtime.capabilities import RuntimeCapabilities
+from galaxy_toolsmith.runtime.mlx_lm_lora import _merge_tokenizer_config
 
 
 def _training_profile() -> TrainingProfile:
@@ -92,15 +95,15 @@ class _TorchCuda:
     float16 = "fp16"
 
 
-def _runtime_capabilities(cuda: bool = True) -> RuntimeCapabilities:
+def _runtime_capabilities(cuda: bool = True, mps: bool = False) -> RuntimeCapabilities:
     return RuntimeCapabilities(
-        platform="Linux",
-        machine="x86_64",
+        platform="Darwin" if mps else "Linux",
+        machine="arm64" if mps else "x86_64",
         cpu_available=True,
         cuda_available=cuda,
         rocm_available=False,
-        mps_available=False,
-        recommended_backend="cuda" if cuda else "cpu",
+        mps_available=mps,
+        recommended_backend="cuda" if cuda else ("mps" if mps else "cpu"),
     )
 
 
@@ -125,6 +128,31 @@ def _write_trainable_corpus(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return corpus_jsonl
+
+
+def test_load_training_profile_defaults_training_method_for_old_configs(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "name": "old-profile",
+                        "base_model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                        "provider": "local",
+                        "quantization": "none",
+                        "backend": "axolotl",
+                        "skills_profile": "default",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_training_profile(profile_path, "old-profile")
+
+    assert profile.training_method == "lora"
 
 
 def test_record_training_help_text_includes_container_usage_once() -> None:
@@ -296,6 +324,29 @@ def test_select_backend_auto_uses_axolotl_when_profile_requests_it() -> None:
 
     assert selection.selected_backend == "axolotl"
     assert selection.fallback_reason == ""
+
+
+def test_select_backend_auto_uses_mlx_when_profile_requests_it() -> None:
+    profile = TrainingProfile(
+        name="mps-qwen25-7b",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+    )
+
+    selection = _select_backend(
+        profile=profile,
+        command_override=None,
+        capabilities=_runtime_capabilities(cuda=False, mps=True),
+    )
+
+    assert selection.intended_backend == "mlx-lm"
+    assert selection.selected_backend == "mlx-lm"
+    assert selection.fallback_reason == ""
+    assert selection.intended_methodology_supported is True
 
 
 def test_load_instruction_records_includes_container_help_text(tmp_path: Path) -> None:
@@ -636,6 +687,60 @@ def test_axolotl_config_uses_lora_for_non_quantized_override(tmp_path: Path) -> 
     assert "bnb_4bit_quant_type" not in config
 
 
+def test_axolotl_config_omits_adapter_for_full_training(tmp_path: Path) -> None:
+    profile = TrainingProfile(
+        name="full-qwen25-7b",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        training_method="full",
+        learning_rate=2e-5,
+    )
+
+    config = _axolotl_config(
+        profile=profile,
+        train_jsonl_path=tmp_path / "train.jsonl",
+        prepared_dir=tmp_path / "prepared",
+        output_dir=tmp_path / "output",
+    )
+
+    assert "adapter" not in config
+    assert "lora_r" not in config
+    assert "lora_target_linear" not in config
+    assert config["learning_rate"] == 2e-5
+
+
+def test_training_method_validation_rejects_invalid_combinations() -> None:
+    full_quantized = TrainingProfile(
+        name="bad-full",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="4bit",
+        backend="axolotl",
+        skills_profile="default",
+        default_command=[],
+        training_method="full",
+    )
+    qlora_mlx = TrainingProfile(
+        name="bad-mlx",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="4bit",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+        training_method="qlora",
+    )
+
+    with pytest.raises(ValueError, match="full requires quantization=none"):
+        _validate_training_method(full_quantized, "axolotl")
+    with pytest.raises(ValueError, match="not supported by the mlx-lm"):
+        _validate_training_method(qlora_mlx, "mlx-lm")
+
+
 def test_fsdp_transformer_layer_inference_maps_common_families() -> None:
     assert (
         _fsdp_transformer_layer_cls(
@@ -790,6 +895,8 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
             attn_implementation="xformers",
             per_device_batch_size=1,
             gradient_accumulation_steps=2,
+            learning_rate=2e-5,
+            training_method="full",
         ),
         status_log_path=tmp_path / "train.status.jsonl",
         status_interval_seconds=15,
@@ -810,6 +917,10 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
     assert "xformers" in command
     assert "--per-device-batch-size" in command
     assert "--gradient-accumulation-steps" in command
+    assert "--learning-rate" in command
+    assert "2e-05" in command
+    assert "--training-method" in command
+    assert "full" in command
     assert "--status-log" in command
     assert str(tmp_path / "train.status.jsonl") in command
     assert "--stream-logs" in command
@@ -977,6 +1088,37 @@ def test_build_sft_trainer_supports_current_trl_kwargs(tmp_path: Path) -> None:
     assert "tokenizer" not in trainer.kwargs
 
 
+def test_build_sft_trainer_omits_peft_config_for_full_training(tmp_path: Path) -> None:
+    class FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FullSFTTrainer:
+        def __init__(self, model, args, train_dataset=None, processing_class=None):
+            self.kwargs = dict(locals())
+            self.kwargs.pop("self")
+
+    profile = _training_profile()
+    args = _build_sft_args(
+        training_arguments_cls=FakeTrainingArguments,
+        sft_config_cls=None,
+        profile=profile,
+        checkpoints_dir=tmp_path / "checkpoints",
+    )
+    trainer = _build_sft_trainer(
+        FullSFTTrainer,
+        model="model",
+        train_dataset="dataset",
+        tokenizer="tokenizer",
+        args=args,
+        peft_config=None,
+        profile=profile,
+    )
+
+    assert "peft_config" not in trainer.kwargs
+    assert trainer.kwargs["processing_class"] == "tokenizer"
+
+
 def test_run_training_command_backend_creates_variant_manifest(tmp_path: Path) -> None:
     paths = WorkspacePaths.from_repo_root(tmp_path)
     paths.create_directories()
@@ -1011,8 +1153,15 @@ def test_run_training_command_backend_creates_variant_manifest(tmp_path: Path) -
     assert "source_quantization" in metrics
     assert "intended_backend" in metrics
     assert "intended_methodology_supported" in metrics
+    assert metrics["requested_training_method"] == "lora"
+    assert metrics["effective_training_method"] == "qlora"
+    assert metrics["artifact_kind"] == "unknown"
     assert "progress" in metrics
     assert metrics["progress"]["total_units"] == 1
+    variant = json.loads(Path(run.model_variant_path).read_text(encoding="utf-8"))
+    assert variant["training_method"] == "lora"
+    assert variant["effective_training_method"] == "qlora"
+    assert variant["artifact_kind"] == "unknown"
 
 
 def test_run_training_axolotl_dry_run_writes_config_and_dataset(tmp_path: Path) -> None:
@@ -1064,6 +1213,122 @@ def test_run_training_axolotl_dry_run_writes_config_and_dataset(tmp_path: Path) 
     assert metrics["training_data_diagnostics"]["total_corpus_records"] == 1
     assert metrics["training_data_diagnostics"]["trainable_samples"] == 1
     assert metrics["training_data_diagnostics"]["target_source_counts"] == {"expanded": 1}
+
+
+def test_run_training_mlx_dry_run_writes_config_and_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    corpus_jsonl = _write_trainable_corpus(tmp_path)
+    dataset_manifest = tmp_path / "dataset.manifest.json"
+    dataset_manifest.write_text(json.dumps({"dataset_id": "dset-1"}), encoding="utf-8")
+    monkeypatch.setattr(
+        training_mod,
+        "detect_runtime_capabilities",
+        lambda: _runtime_capabilities(cuda=False, mps=True),
+    )
+    profile = TrainingProfile(
+        name="mps-qwen25-7b",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+        max_seq_length=4096,
+        per_device_batch_size=1,
+        gradient_accumulation_steps=2,
+    )
+
+    run = run_training(
+        paths=paths,
+        profile=profile,
+        dataset_manifest_path=dataset_manifest,
+        command_override=None,
+        variant_id="variant-mlx",
+        corpus_jsonl_path=corpus_jsonl,
+        dry_run_backend=True,
+    )
+
+    assert run.status == "dry-run"
+    metrics = json.loads(Path(run.metrics_path).read_text(encoding="utf-8"))
+    assert metrics["backend_impl"] == "mlx-lm"
+    assert metrics["intended_backend"] == "mlx-lm"
+    assert metrics["intended_methodology_supported"] is True
+    assert metrics["samples"] == 1
+    assert metrics["command"][1:3] == ["-m", "galaxy_toolsmith.runtime.mlx_lm_lora"]
+    train_record = json.loads(Path(metrics["train_jsonl_path"]).read_text(encoding="utf-8"))
+    assert "Usage: echo_tool --input FILE" in train_record["prompt"]
+    assert train_record["completion"].startswith('<tool id="echo_tool"')
+    config = yaml.safe_load(Path(metrics["config_path"]).read_text(encoding="utf-8"))
+    assert config["model"] == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert config["train"] is True
+    assert config["fine_tune_type"] == "lora"
+    assert config["adapter_path"] == metrics["adapter_path"]
+    assert config["data"] == metrics["data_dir"]
+    assert config["max_seq_length"] == 4096
+    assert config["batch_size"] == 1
+    assert config["grad_accumulation_steps"] == 2
+    assert config["mask_prompt"] is True
+    assert config["lora_parameters"]["rank"] == 16
+    assert "tokenizer_config" not in config
+
+
+def test_mlx_lm_config_uses_finetuning_mode_for_mistral_common(tmp_path: Path) -> None:
+    profile = TrainingProfile(
+        name="mps-devstral-24b",
+        base_model="mistralai/Devstral-Small-2505",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+    )
+
+    config = _mlx_lm_config(
+        profile=profile,
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "output",
+        sample_count=1,
+    )
+
+    assert config["mask_prompt"] is False
+    assert config["tokenizer_config"] == {"mode": "finetuning"}
+
+
+def test_mlx_lm_lora_wrapper_merges_tokenizer_config() -> None:
+    merged = _merge_tokenizer_config(
+        {"trust_remote_code": True, "mode": "test"},
+        {"mode": "finetuning"},
+    )
+
+    assert merged == {"trust_remote_code": True, "mode": "finetuning"}
+
+
+def test_mlx_lm_config_supports_full_training(tmp_path: Path) -> None:
+    profile = TrainingProfile(
+        name="mps-qwen25-7b-full",
+        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        provider="local",
+        quantization="none",
+        backend="mlx-lm",
+        skills_profile="default",
+        default_command=[],
+        training_method="full",
+    )
+
+    config = _mlx_lm_config(
+        profile=profile,
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "output",
+        sample_count=4,
+    )
+
+    assert config["fine_tune_type"] == "full"
+    assert config["num_layers"] == 0
+    assert "lora_parameters" not in config
 
 
 def test_run_training_axolotl_dry_run_applies_non_quantized_overrides(tmp_path: Path) -> None:

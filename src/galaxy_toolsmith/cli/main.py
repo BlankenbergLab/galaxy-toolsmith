@@ -52,7 +52,12 @@ from galaxy_toolsmith.inference.source_context import (
 )
 from galaxy_toolsmith.inference.udt import udt_yaml_to_tool_xml, validate_udt_yaml
 from galaxy_toolsmith.inference.validation import PlanemoTestOptions
-from galaxy_toolsmith.models.training import load_training_profile, write_default_training_profiles
+from galaxy_toolsmith.models.training import (
+    TRAINING_METHODS,
+    load_training_profile,
+    write_default_training_profiles,
+)
+from galaxy_toolsmith.orchestration.adapter_conversion import convert_mlx_lora_to_peft
 from galaxy_toolsmith.orchestration.benchmark import (
     DEFAULT_BENCHMARK_MIN_ITEMS_PER_PROCESS,
     run_benchmark_generation,
@@ -581,7 +586,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument(
         "--backend",
-        choices=["auto", "axolotl", "hf-sft", "command"],
+        choices=["auto", "axolotl", "hf-sft", "command", "mlx-lm", "mlx", "mps"],
         default="auto",
         help="Training backend override (default: auto, using the profile backend).",
     )
@@ -649,6 +654,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--gradient-accumulation-steps",
         type=int,
         help="Override the profile gradient accumulation steps for this run.",
+    )
+    train_parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help="Override the profile learning rate for this run.",
+    )
+    train_parser.add_argument(
+        "--training-method",
+        choices=sorted(TRAINING_METHODS),
+        help="Override training method: lora, qlora, or full.",
     )
     train_parser.add_argument(
         "--status-log",
@@ -749,6 +764,28 @@ def _build_parser() -> argparse.ArgumentParser:
     export_ollama_parser.add_argument("--model-name", required=True)
     export_ollama_parser.add_argument("--from-quantization", default="q4_k_m")
     export_ollama_parser.add_argument("--create", action="store_true")
+
+    convert_adapter_parser = subparsers.add_parser(
+        "convert-adapter",
+        help="Convert supported adapter artifacts between local formats.",
+    )
+    convert_adapter_parser.add_argument("--from", dest="from_format", choices=["mlx"], required=True)
+    convert_adapter_parser.add_argument("--to", dest="to_format", choices=["peft"], required=True)
+    convert_adapter_parser.add_argument(
+        "--base-model",
+        required=True,
+        help="Base model id/path used to select the architecture mapping.",
+    )
+    convert_adapter_parser.add_argument(
+        "--adapter-dir",
+        required=True,
+        help="Input MLX adapter directory containing adapter_config.json and adapters.safetensors.",
+    )
+    convert_adapter_parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Output directory for the PEFT adapter.",
+    )
 
     generate_parser = subparsers.add_parser(
         "generate-wrapper",
@@ -985,6 +1022,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     train_remote_submit.add_argument("--variant-id", default="")
     train_remote_submit.add_argument("--command", nargs="+", dest="trainer_command")
+    train_remote_submit.add_argument("--learning-rate", type=float)
+    train_remote_submit.add_argument(
+        "--training-method",
+        choices=sorted(TRAINING_METHODS),
+        help="Override training method: lora, qlora, or full.",
+    )
 
     train_remote_status = subparsers.add_parser(
         "train-remote-status",
@@ -2131,6 +2174,12 @@ def main() -> int:
                     "num_processes": args.num_processes,
                     "distributed_strategy": args.distributed_strategy
                     or profile.distributed_strategy,
+                    "training_method": args.training_method or profile.training_method,
+                    "learning_rate": (
+                        args.learning_rate
+                        if args.learning_rate is not None
+                        else profile.learning_rate
+                    ),
                     "variant_id": args.variant_id,
                     "source_context": source_context.to_dict(),
                 },
@@ -2158,6 +2207,8 @@ def main() -> int:
                     attn_implementation=args.attn_implementation,
                     per_device_batch_size=args.per_device_batch_size,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    learning_rate=args.learning_rate,
+                    training_method=args.training_method,
                 ),
                 distributed_strategy=args.distributed_strategy or None,
                 status_log_path=status_log_path,
@@ -2259,6 +2310,8 @@ def main() -> int:
             "corpus_jsonl_path": str(Path(args.corpus_jsonl).resolve()),
             "variant_id": args.variant_id,
             "trainer_command": list(args.trainer_command or []),
+            "learning_rate": args.learning_rate,
+            "training_method": args.training_method,
         }
         result = request_remote_json(
             server_url=args.server_url,
@@ -2353,6 +2406,18 @@ def main() -> int:
                     command_override=list(task_payload.get("trainer_command", [])),
                     variant_id=str(task_payload.get("variant_id", "")).strip() or None,
                     corpus_jsonl_path=Path(str(task_payload["corpus_jsonl_path"])).resolve(),
+                    profile_overrides=TrainingProfileOverrides(
+                        learning_rate=(
+                            float(task_payload["learning_rate"])
+                            if task_payload.get("learning_rate") is not None
+                            else None
+                        ),
+                        training_method=(
+                            str(task_payload["training_method"])
+                            if task_payload.get("training_method")
+                            else None
+                        ),
+                    ),
                 )
                 run_data = json.loads(run.to_json())
                 artifacts: list[dict] = []
@@ -2529,6 +2594,44 @@ def main() -> int:
                 },
             )
             print(json.dumps(payload, indent=2))
+            return 0
+        except Exception as error:
+            tracker.fail(error)
+            raise
+
+    if args.command == "convert-adapter":
+        paths.create_directories()
+        tracker = create_monitor_run_tracker(
+            paths,
+            kind="export",
+            command=_monitor_command(),
+            inputs={
+                "from": args.from_format,
+                "to": args.to_format,
+                "base_model": args.base_model,
+                "adapter_dir": str(Path(args.adapter_dir).resolve()),
+                "output_dir": str(Path(args.output_dir).resolve()),
+            },
+        )
+        try:
+            if args.from_format == "mlx" and args.to_format == "peft":
+                result = convert_mlx_lora_to_peft(
+                    base_model=args.base_model,
+                    adapter_dir=Path(args.adapter_dir).resolve(),
+                    output_dir=Path(args.output_dir).resolve(),
+                )
+            else:  # pragma: no cover - parser choices currently prevent this.
+                raise ValueError(f"Unsupported adapter conversion: {args.from_format} -> {args.to_format}")
+            payload = json.loads(result.to_json())
+            tracker.complete(
+                outputs={"output_dir": payload.get("output_dir", "")},
+                summary={
+                    "status": payload.get("status", ""),
+                    "converted_tensors": payload.get("converted_tensors", 0),
+                    "architecture": payload.get("architecture", ""),
+                },
+            )
+            print(result.to_json())
             return 0
         except Exception as error:
             tracker.fail(error)

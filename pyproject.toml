@@ -55,8 +55,9 @@ training = [
 ]
 # Apple Silicon (MPS) training and inference via mlx.
 mps = [
-  "mlx>=0.18",
-  "mlx-lm>=0.18",
+  "mlx>=0.31.2,<0.32",
+  "mlx-lm[train]>=0.31.3,<0.32",
+  "mistral-common>=1.11",
 ]
 # torchtune for portable fine-tuning (CPU / MPS / CUDA fallback without unsloth).
 torchtune = [

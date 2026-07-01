@@ -43,6 +43,9 @@ class ModelVariantManifest:
     provider: str = "local"
     skills_profile: str = "default"
     backend: str = "auto"
+    training_method: str = "lora"
+    effective_training_method: str = "lora"
+    artifact_kind: str = "unknown"
     artifact_dir: str = ""
     export_quantizations: list[str] = field(default_factory=list)
     ollama_model_name: str = ""
@@ -62,6 +65,9 @@ class TrainingRunManifest:
     provider: str = "local"
     base_model: str = ""
     quantization: str = "none"
+    training_method: str = "lora"
+    effective_training_method: str = "lora"
+    artifact_kind: str = "unknown"
     dataset_manifest_path: str = ""
     dataset_id: str = ""
     command: list[str] = field(default_factory=list)
