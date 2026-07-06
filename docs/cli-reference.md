@@ -42,11 +42,63 @@ provided manually.
 | `--source-context-max-files <n>` | Maximum source files added to a single prompt or training sample. |
 | `--source-root <dir>` | Scan a manual source tree for one-off generation or training input. |
 | `--source-file <path>` | Include one manual source file for one-off generation or training input. |
+| `--source-archive <path-or-url>` | For one-off generation, copy or download a source archive, safely extract it into `.gtsm-cache/manual-sources/archives/`, and scan the extracted source tree. Supports local paths plus HTTP(S)/FTP URLs. |
 
 When source checkout metadata comes from `extract-corpus`, the source context
 loader uses the recorded package/version mappings and cached upstream source
 trees. For archive downloads, the extracted source tree is used, not just the
 conda recipe.
+
+### Runtime discovery for generation
+
+`generate-wrapper`, `plan-suite`, and `generate-suite` can collect help/source
+context directly from a runnable package before prompting the model. This is
+useful when the input directory contains source but no captured help text, or
+when subcommand help should be probed live.
+
+```bash
+gtsm generate-suite \
+  --tool-name minibwa \
+  --discovery-mode conda \
+  --discovery-package minibwa \
+  --discovery-command minibwa \
+  --source-context-mode snippets \
+  --source-context-max-chars 32000 \
+  --output-dir repo/suite_minibwa
+```
+
+`--discovery-mode conda` creates or reuses a cached environment from Bioconda
+and conda-forge, runs help probes in an isolated temporary working directory,
+probes detected subcommands, and resolves upstream source using package recipes.
+`--discovery-mode biocontainer` resolves a BioContainer, preferring the local
+container runtime order used by corpus extraction. `--discovery-mode auto` tries
+Conda first and falls back to Biocontainers when Conda does not produce accepted
+help.
+
+| Option | Meaning |
+| --- | --- |
+| `--discovery-mode none|conda|biocontainer|auto` | Runtime discovery mode. Defaults to `none`. |
+| `--discovery-package <spec>` | Conda package spec to install/resolve, such as `samtools` or `samtools=1.20`; repeat for multi-package tools. Defaults to the discovery command or tool name. |
+| `--discovery-command <cmd>` | Executable command to probe. Defaults to the first discovery package name. |
+| `--discovery-channel <name>` | Conda channel order for env creation. Defaults to `bioconda`, then `conda-forge`; repeat to override. |
+| `--discovery-env-dir <dir>` | Reuse a specific conda environment prefix. |
+| `--discovery-cache-dir <dir>` | Cache root for generated discovery environments. |
+| `--discovery-conda-executable <path>` | Explicit `mamba`, `micromamba`, or `conda` executable. |
+| `--discovery-conda-timeout-seconds <n>` | Timeout for conda environment creation. Defaults to `900`. |
+| `--discover-subcommands` / `--no-discover-subcommands` | Enable or disable probing subcommands detected from top-level help. Enabled by default. |
+| `--max-discovered-subcommands <n>` | Maximum subcommands to probe. Defaults to `8`. |
+| `--discovery-container-runtime auto|singularity|apptainer|docker` | Runtime for Biocontainers discovery. `auto` prefers available Singularity/Apptainer before Docker. |
+| `--discovery-container-cache-dir <dir>` | Container cache directory. |
+| `--discovery-docker-use-sudo` | Prefix Docker commands with `sudo`. |
+| `--discovery-container-help-probe-mode safe|exploratory` | Probe breadth. `exploratory` tries additional forms such as positional `help` and no-argument usage. |
+| `--discovery-container-timeout-seconds <n>` | Per-help-command timeout. Defaults to `120`. |
+| `--discovery-bioconda-ref <ref>` | Bioconda-recipes ref for source resolution. Defaults to `master`. |
+| `--discovery-source-download-max-bytes <size>` | Automatic source download cap. Defaults to `0` for unlimited; accepts values like `1GB` or `1GiB`. |
+| `--discovery-source-download-timeout-seconds <n>` | Automatic source download timeout. Defaults to `60`. |
+
+If `--help-text-file` is also provided, manual help and runtime-discovered help
+are both included. If no manual `--source-root` or `--source-archive` is given,
+the source checkout resolved during discovery is used for source context.
 
 ### Provider Selection
 
@@ -387,6 +439,38 @@ Profiles live in `config/training.profiles.json`. They define the base model,
 backend, batch sizing, default sequence length, LoRA settings, quantization
 policy, and related runtime defaults.
 
+### `estimate-training-tokens`
+
+Estimate training sample sizes across context-length and source-context
+candidates before launching GPU training.
+
+```bash
+gtsm estimate-training-tokens \
+  --profile agentic-devstral-24b \
+  --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl \
+  --artifact-format mixed \
+  --source-context-mode all-filtered \
+  --compare-source-context-modes all-raw,all-filtered \
+  --source-context-budget-ladder \
+  --max-seq-lengths 128k,96k,64k,48k,32k,24k,16k,12k,8k,4k,2k
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--profile <name>` | Training profile used for tokenizer/model metadata. |
+| `--corpus-jsonl <jsonl>` | Training corpus JSONL. |
+| `--artifact-format xml|udt-yaml|mixed` | Target format to estimate. |
+| `--max-seq-lengths <list>` | Comma-separated context lengths. A `k` suffix means 1024 tokens. |
+| `--source-context-mode <mode>` | Base source-context mode. |
+| `--compare-source-context-modes <list>` | Compare multiple source modes, such as `all-raw,all-filtered`. |
+| `--source-context-budget-ladder` | Use built-in source char/file budgets for each context length, including 8k/4k/2k fallbacks. |
+| `--limit <n>` | Estimate only the first `n` corpus records. `0` means full corpus. |
+| `--exact-tokenizer` | Use the profile tokenizer from local model cache instead of character-ratio estimates. |
+| `--chars-per-token <float>` | Character-ratio estimate used without `--exact-tokenizer`. |
+| `--progress-interval <n>` | Print progress every `n` corpus records. |
+| `--workers <n>` | Estimator worker threads. `0` uses an automatic bounded worker count. |
+| `--longest-sample-count <n>` | Include the longest `n` generated training samples per source-context estimate, with wrapper paths and source-context sizes, so overflow outliers can be inspected. |
+
 ### `train`
 
 Run profile-based training and persist a model variant manifest.
@@ -428,6 +512,7 @@ gtsm train \
 | `--distributed-strategy auto|ddp|fsdp|deepspeed-zero3|deepspeed-zero3-offload` | Multi-GPU strategy. |
 | `--dry-run-backend` | Build backend inputs and print metadata without launching training. |
 | `--max-seq-length <n>` | Override profile sequence length. |
+| `--max-steps <n>` | Stop after `n` optimizer steps. Useful for memory probes before full training. |
 | `--pad-to-sequence-len` | Pad samples to the full sequence length. |
 | `--no-pad-to-sequence-len` | Do not force full-length padding. Useful for reducing memory pressure on long-context runs. |
 | `--attn-implementation <name>` | Override Axolotl attention backend: `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flex_attention`, `xformers`, `sage`, or `fp8`. |
@@ -449,19 +534,26 @@ gtsm train \
 | `--post-ollama-model-name <name>` | Generate an Ollama Modelfile for the post-exported quantized model. |
 | `--post-ollama-create` | Run `ollama create` after generating the Modelfile. |
 
+These `train` post hooks run inside the active training environment. For
+dependency-split systems, the context ladder can instead use
+`POST_EXPORT_ENV_DIR=.conda/gtsm-unsloth-export` to run GGUF export and Ollama
+Modelfile generation from a separate packaging environment after training
+succeeds.
+
 Distributed strategies have different memory and throughput tradeoffs:
 
 | Strategy | Behavior |
 | --- | --- |
 | `ddp` | Full model replica per GPU. Fast when each GPU can hold the model, optimizer, activations, and batch. |
 | `fsdp` | Shards model state across GPUs to reduce per-GPU memory. Useful for larger models or longer context. |
-| `deepspeed-zero3` | DeepSpeed ZeRO-3 sharding across GPUs. |
-| `deepspeed-zero3-offload` | ZeRO-3 plus CPU offload. Lower GPU memory pressure at the cost of throughput. |
+| `deepspeed-zero3` | DeepSpeed ZeRO-3 sharding across GPUs. Good default for GPU-only long-context probes. |
+| `deepspeed-zero3-offload` | ZeRO-3 plus CPU offload. Lower GPU memory pressure at the cost of much lower throughput. |
 | `auto` | Let the profile/backend choose. |
 
-For long-context 24B tuning on three 40GB A100 GPUs, `deepspeed-zero3-offload`,
-`--no-pad-to-sequence-len`, and an efficient attention backend can be more
-practical than full model replication.
+For unattended long-context 24B tuning on four 40GB A100 GPUs, prefer
+GPU-only `deepspeed-zero3` or `fsdp` first. Use
+`deepspeed-zero3-offload` only as a manual salvage option when fitting the run
+matters more than throughput.
 
 Training methods are explicit:
 
@@ -568,6 +660,13 @@ The training command can also do this after a successful run with
 `--post-export-quantizations`, `--post-ollama-model-name`, and
 `--post-ollama-create`.
 
+When using `scripts/gtsm_context_ladder_train.sh`, set `POST_EXPORT_ENV_DIR` to
+route post-training GGUF export through the existing
+`scripts/gtsm_llama_cpp_gguf.sh` helper instead of the training environment.
+Useful companion variables are `POST_EXPORT_LLAMA_CPP_DIR`,
+`POST_EXPORT_GGUF_OUTTYPE`, `POST_EXPORT_PREPARE`,
+`POST_EXPORT_SYNC_OVERNIGHT`, and `POST_OLLAMA_FROM_QUANTIZATION`.
+
 ### `convert-adapter`
 
 Convert supported adapter artifacts between local formats.
@@ -614,16 +713,38 @@ gtsm generate-wrapper \
   --output bwa_mem.xml
 ```
 
+Use `--source-archive` when the upstream source is still compressed:
+
+```bash
+gtsm generate-wrapper \
+  --provider ollama \
+  --model gtsm-tools-iuc-devstral-24b-xml-source-12k-q4 \
+  --tool-name bwa_mem \
+  --help-text-file bwa_mem.help.txt \
+  --artifact-format xml \
+  --source-context-mode all-filtered \
+  --source-archive https://github.com/lh3/bwa/archive/refs/tags/v0.7.17.tar.gz \
+  --source-archive-max-bytes 1GB \
+  --temperature 0 \
+  --max-tokens 8192 \
+  --output bwa_mem.xml
+```
+
 | Option | Meaning |
 | --- | --- |
-| `--tool-name <name>` | Required tool identifier/name. |
-| `--help-text-file <path>` | Required command help text file. |
+| `--tool-name <name>` | Required tool display name. This can contain spaces. |
+| `--tool-id <id>` | Optional Galaxy tool id. Defaults to a safe id derived from `--tool-name`. |
+| `--help-text-file <path>` | Command help text file. Required unless runtime discovery supplies accepted help. |
 | `--artifact-format xml|udt-yaml` | Output artifact format. Defaults to XML. |
+| `--tool-granularity single|subcommands|suite|auto` | Hint whether the prompt should focus on one command, separable subcommands, or a suite. The command still writes one primary artifact unless sidecars are requested. |
 | `--source-file <path>` | Optional source file to add to the prompt. |
 | `--source-context-mode <mode>` | Source-code context mode. |
 | `--source-context-max-chars <n>` | Source context character budget. |
 | `--source-context-max-files <n>` | Source file count budget. |
 | `--source-root <dir>` | Source tree to scan. |
+| `--source-archive <path-or-url>` | Source archive path or URL to extract and scan. Mutually exclusive with `--source-root`. |
+| `--source-archive-max-bytes <size>` | Archive cap for local copy or URL download. Defaults to `1GB`; use `0` for unlimited. |
+| `--source-archive-timeout-seconds <n>` | Timeout for source archive URL downloads. Defaults to `120`. |
 | `--provider local|openai|anthropic|copilot|ollama` | Generation provider. Defaults to `local`. |
 | `--model <name>` | Provider model name override. |
 | `--temperature <float>` | Sampling temperature. Defaults to `0.1`. |
@@ -632,7 +753,90 @@ gtsm generate-wrapper \
 | `--model-variant <id>` | Variant label stored in generation metadata. |
 | `--skills-profile <name>` | Prompt skills profile. Defaults to `default`. |
 | `--allow-stub-local` | Permit canned local XML when no real local model is configured. Use only for smoke tests. |
-| `--output <path>` | Required output artifact path. |
+| `--repair-invalid-xml` | Retry malformed, non-tool, truncated, or degenerate XML once with a stricter prompt. Enabled by default. |
+| `--no-repair-invalid-xml` | Disable the one-shot XML repair retry. |
+| `--stream-output` | For local HF/PEFT generation, stream decoded model text to stderr while generating. |
+| `--raw-response-log <path>` | Write the full unstripped model response. With `--stream-output`, defaults to `<output>.raw-response.log` when omitted. |
+| `--generate-sidecars` | Write companion sidecar XML blocks after extracting the primary `<tool>` artifact. |
+| `--sidecar-output-dir <dir>` | Directory for sidecars; defaults to `<output>.sidecars/`. |
+| `--no-toolsmith-citation` | Do not add the deterministic Galaxy Toolsmith GitHub citation to the generated artifact. |
+| `--no-datatype-scaffold` | Do not write review scaffolds for unknown Galaxy datatypes. |
+| `--repository-output-dir <dir>` | Write a Tool Shed-style repository bundle instead of only a standalone artifact. |
+| `--shed-name <name>` | Repository name for generated `.shed.yml`. |
+| `--shed-owner <owner>` | Repository owner for generated `.shed.yml`. |
+| `--shed-description <text>` | Repository description for generated `.shed.yml`. |
+| `--shed-category <name>` | Repository category; repeatable. |
+| `--no-shed-yml` | Do not write `.shed.yml` in repository output mode. |
+| `--output <path>` | Output artifact path. Required unless `--repository-output-dir` is provided. |
+
+For XML generation, the primary output is always expected to be a single
+`<tool>...</tool>` document. Macros, tool data table configs, and `.loc.sample`
+files are sidecars: they may be generated when `--generate-sidecars` is used,
+but a lone `<macros>` or `<tables>` document is invalid as the primary artifact
+and triggers repair unless repair is disabled.
+
+Wrapper helper scripts, command snippets in `configfiles`, and source-code entry
+points are useful context for understanding an existing Galaxy wrapper and are
+used during corpus/training preparation. During generation, prefer direct
+underlying tool commands where possible; generated helper-script `configfiles`
+should be reserved for cases where Galaxy templating cannot express the command
+cleanly.
+
+Repository output mode writes `<repo>/<tool_id>.xml`, optional sidecars,
+`.shed.yml`, and `.gtsm/generation-record.json`. It is XML-only; UDT generation
+remains a single-artifact path.
+
+Generated artifacts include a Galaxy Toolsmith GitHub citation by default. This
+is added after inference, so it does not consume model prompt/output budget. In
+suite generation, sidecar-enabled output can reference the shared citation macro
+in `macros.xml`; standalone outputs receive a direct `<citations>` block.
+
+Unknown datatypes are scaffolded by default. Repository and suite outputs write
+`.gtsm/unknown-datatypes.json`, `datatypes_conf.xml.sample`, and
+`README.datatypes.md` at the repository root. Standalone outputs write the same
+review files under `<output>.gtsm/`. The scaffold maps unknown extensions to
+`galaxy.datatypes.data:Text` as a placeholder that should be reviewed before
+installation.
+
+### `plan-suite`
+
+Inspect help/source context and propose whether a package should be generated
+as multiple focused Galaxy tools.
+
+```bash
+gtsm plan-suite \
+  --tool-name samtools \
+  --help-text-file samtools.help.txt \
+  --max-suite-tools 8
+```
+
+The output is strict JSON with `suite_recommended`, a reason, and planned tool
+members. It does not generate files.
+
+### `generate-suite`
+
+Generate a Tool Shed-style repository bundle with multiple wrapper XML files.
+
+```bash
+gtsm generate-suite \
+  --provider ollama \
+  --model gtsm-tools-iuc-devstral-24b-xml-source-12k-q4 \
+  --tool-name samtools \
+  --help-text-file samtools.help.txt \
+  --source-context-mode all-filtered \
+  --source-root source/samtools \
+  --output-dir repo/suite_samtools \
+  --shed-owner iuc \
+  --shed-category "Sequence Analysis" \
+  --max-suite-tools 8
+```
+
+The bundle includes one `<tool_id>.xml` per planned member, shared sidecars when
+requested, `.shed.yml`, `.gtsm/suite-plan.json`,
+`.gtsm/generation-records.json`, and optional raw logs under `.gtsm/raw/`.
+Tool XML ids and filenames are safe identifiers; human-readable tool names may
+contain spaces. By default the bundle also includes the Toolsmith citation,
+macro opportunity metadata, and datatype scaffolds for unknown formats.
 
 ### `generate-wrapper-remote`
 
@@ -654,6 +858,7 @@ gtsm generate-wrapper-remote \
 | `--server-url <url>` | Server base URL. Defaults to `http://127.0.0.1:8765`. |
 | `--auth-token-env <name>` | Environment variable containing bearer token. Defaults to `GTSM_SERVER_AUTH_TOKEN`. |
 | `--tool-name <name>` | Required tool identifier/name. |
+| `--tool-id <id>` | Optional Galaxy tool id. Defaults to a safe id derived from `--tool-name`. |
 | `--help-text-file <path>` | Required help text file. |
 | `--source-file <path>` | Optional source file to send. |
 | `--artifact-format xml|udt-yaml` | Artifact format. |
@@ -664,7 +869,22 @@ gtsm generate-wrapper-remote \
 | `--temperature <float>` | Sampling temperature. |
 | `--max-tokens <n>` | Maximum output tokens. |
 | `--max-prompt-help-chars <n>` | Maximum help text characters in prompt. |
+| `--no-toolsmith-citation` | Do not add the deterministic Galaxy Toolsmith citation. |
+| `--no-datatype-scaffold` | Do not write unknown-datatype scaffold files next to the local output. |
 | `--output <path>` | Required output artifact path. |
+
+### `generate-suite-remote`
+
+Generate a repository bundle through a running `gtsm serve` endpoint and write
+the returned artifacts locally.
+
+```bash
+gtsm generate-suite-remote \
+  --server-url http://127.0.0.1:8765 \
+  --tool-name samtools \
+  --help-text-file samtools.help.txt \
+  --output-dir repo/suite_samtools
+```
 
 ### `convert-udt`
 
@@ -931,6 +1151,8 @@ GTSM_OLLAMA_TIMEOUT_SECONDS=900 gtsm benchmark-generate \
 | `--source-context-max-chars <n>` | Source context character budget. |
 | `--source-context-max-files <n>` | Source file count budget. |
 | `--source-root <dir>` | Manual source tree to scan. |
+| `--suite-generation single|recommend|generate` | Suite handling. `single` keeps one wrapper per record, `recommend` records a suite plan, and `generate` writes repository bundles and evaluates all generated XML wrappers. |
+| `--max-suite-tools <n>` | Maximum suite members for recommendation or suite generation. |
 | `--repair-invalid-xml` | Retry malformed/non-tool/degenerate XML once with a stricter prompt. Enabled by default. |
 | `--no-repair-invalid-xml` | Disable automatic XML repair retry. |
 | `--allow-compact-fallback` | After a truncated XML generation and failed repair, write a minimal placeholder wrapper. Off by default; use only for smoke tests, not quality benchmarks. |

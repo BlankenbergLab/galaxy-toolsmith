@@ -43,12 +43,41 @@ from galaxy_toolsmith.inference.artifacts import (
 )
 from galaxy_toolsmith.inference.evaluation import evaluate_wrapper_paths
 from galaxy_toolsmith.inference.generation import generate_wrapper
+from galaxy_toolsmith.inference.postprocess import (
+    datatype_scaffold_dir_for_output,
+    write_datatype_scaffold,
+)
 from galaxy_toolsmith.inference.prompt_context import DEFAULT_MAX_PROMPT_HELP_CHARS
+from galaxy_toolsmith.inference.repository import (
+    build_tool_shed_metadata,
+    safe_repository_name,
+    safe_tool_id,
+    write_gtsm_json,
+    write_shed_yml,
+)
+from galaxy_toolsmith.inference.runtime_discovery import (
+    DEFAULT_DISCOVERY_CHANNELS,
+    DISCOVERY_MODES,
+    RuntimeDiscoveryResult,
+    RuntimeDiscoverySettings,
+    discover_runtime_context,
+    normalize_discovery_mode,
+)
+from galaxy_toolsmith.inference.source_archives import (
+    DEFAULT_SOURCE_ARCHIVE_MAX_BYTES,
+    DEFAULT_SOURCE_ARCHIVE_TIMEOUT_SECONDS,
+    resolve_source_archive,
+)
 from galaxy_toolsmith.inference.source_context import (
     DEFAULT_SOURCE_CONTEXT_MAX_CHARS,
     DEFAULT_SOURCE_CONTEXT_MAX_FILES,
     SOURCE_CONTEXT_MODES,
     source_context_settings,
+)
+from galaxy_toolsmith.inference.suite import (
+    compare_generation_run_dirs,
+    generate_suite,
+    plan_suite_from_content,
 )
 from galaxy_toolsmith.inference.udt import udt_yaml_to_tool_xml, validate_udt_yaml
 from galaxy_toolsmith.inference.validation import PlanemoTestOptions
@@ -66,6 +95,7 @@ from galaxy_toolsmith.orchestration.benchmark import (
 from galaxy_toolsmith.orchestration.export import (
     create_ollama_model,
     export_model_artifacts,
+    normalize_ollama_model_name,
     update_variant_ollama_metadata,
     write_ollama_modelfile,
 )
@@ -82,6 +112,12 @@ from galaxy_toolsmith.orchestration.training import (
     list_local_training_runs,
     run_training,
 )
+from galaxy_toolsmith.orchestration.training_estimates import (
+    DEFAULT_CONTEXT_LENGTHS,
+    estimate_training_tokens,
+    parse_context_lengths,
+    parse_source_context_modes,
+)
 from galaxy_toolsmith.runtime.capabilities import detect_runtime_capabilities
 from galaxy_toolsmith.runtime.estimates import model_estimates_json
 from galaxy_toolsmith.runtime.model_source import model_cache_info
@@ -94,9 +130,7 @@ from galaxy_toolsmith.runtime.status import emit_status, resolve_status_log_path
 from galaxy_toolsmith.server.app import serve
 
 PLANEMO_ENGINE_CHOICES = ("galaxy", "docker_galaxy", "cwltool", "toil", "external_galaxy")
-_BYTE_CAP_RE = re.compile(
-    r"^\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>b|[kmgtp](?:i?b?)?)?\s*$", re.I
-)
+_BYTE_CAP_RE = re.compile(r"^\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>b|[kmgtp](?:i?b?)?)?\s*$", re.I)
 _BYTE_CAP_MULTIPLIERS = {
     "": 1,
     "b": 1,
@@ -200,6 +234,7 @@ def _add_source_context_args(
     *,
     include_source_root: bool = False,
     include_source_file: bool = False,
+    source_root_target: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup | None = None,
 ) -> None:
     parser.add_argument(
         "--source-context-mode",
@@ -223,7 +258,8 @@ def _add_source_context_args(
         help="Maximum source files included in each prompt.",
     )
     if include_source_root:
-        parser.add_argument(
+        target = source_root_target or parser
+        target.add_argument(
             "--source-root",
             default="",
             help="Optional source tree to scan for source context.",
@@ -236,14 +272,335 @@ def _add_source_context_args(
         )
 
 
-def _source_context_settings_from_args(args: argparse.Namespace):
+def _source_context_settings_from_args(
+    args: argparse.Namespace,
+    *,
+    source_root: Path | None = None,
+):
+    resolved_source_root = (
+        source_root if source_root is not None else _optional_path(getattr(args, "source_root", ""))
+    )
     return source_context_settings(
         mode=args.source_context_mode,
         max_chars=args.source_context_max_chars,
         max_files=args.source_context_max_files,
-        source_root=_optional_path(getattr(args, "source_root", "")),
+        source_root=resolved_source_root,
         source_file=_optional_path(getattr(args, "source_file", "")),
     )
+
+
+def _add_runtime_discovery_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--discovery-mode",
+        choices=DISCOVERY_MODES,
+        default="none",
+        help=(
+            "Optionally discover runtime help/source before generation using a Bioconda "
+            "conda environment, Biocontainers, or conda then Biocontainers fallback."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-package",
+        action="append",
+        default=[],
+        help=(
+            "Conda package spec to install and inspect, such as minibwa or minibwa=0.2.0. "
+            "Repeat for tools requiring multiple packages. Defaults to the discovery command "
+            "or tool name when discovery is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-command",
+        default="",
+        help="Executable command to probe for help. Defaults to the first discovery package.",
+    )
+    parser.add_argument(
+        "--discovery-channel",
+        action="append",
+        default=[],
+        help="Conda channel for discovery environment creation; repeat to set order.",
+    )
+    parser.add_argument("--discovery-env-dir", default="", help="Reusable conda env prefix.")
+    parser.add_argument(
+        "--discovery-cache-dir",
+        default="",
+        help="Cache directory for discovery conda environments and metadata.",
+    )
+    parser.add_argument(
+        "--discovery-conda-executable",
+        default="",
+        help="Explicit mamba/micromamba/conda executable for discovery env creation.",
+    )
+    parser.add_argument(
+        "--discovery-conda-timeout-seconds",
+        type=int,
+        default=900,
+        help="Timeout for creating the discovery conda environment.",
+    )
+    parser.add_argument(
+        "--discover-subcommands",
+        dest="discover_subcommands",
+        action="store_true",
+        default=True,
+        help="Probe detected subcommands for focused runtime help.",
+    )
+    parser.add_argument(
+        "--no-discover-subcommands",
+        dest="discover_subcommands",
+        action="store_false",
+        help="Only probe top-level runtime help.",
+    )
+    parser.add_argument(
+        "--max-discovered-subcommands",
+        type=int,
+        default=8,
+        help="Maximum subcommands to probe during runtime discovery.",
+    )
+    parser.add_argument(
+        "--discovery-container-runtime",
+        choices=["auto", "singularity", "apptainer", "docker"],
+        default="auto",
+        help="Container runtime for Biocontainers discovery; auto tries local supported runtimes.",
+    )
+    parser.add_argument(
+        "--discovery-container-cache-dir",
+        default="",
+        help="Container cache directory for Biocontainers discovery.",
+    )
+    parser.add_argument(
+        "--discovery-docker-use-sudo",
+        action="store_true",
+        help="Use sudo for Docker commands during Biocontainers discovery.",
+    )
+    parser.add_argument(
+        "--discovery-container-help-probe-mode",
+        choices=["safe", "exploratory"],
+        default="exploratory",
+        help="Help probe breadth for runtime discovery.",
+    )
+    parser.add_argument(
+        "--discovery-container-timeout-seconds",
+        type=int,
+        default=120,
+        help="Per-command timeout for runtime help probes.",
+    )
+    parser.add_argument(
+        "--discovery-bioconda-ref",
+        default="master",
+        help="Bioconda-recipes git ref used when resolving source code.",
+    )
+    parser.add_argument(
+        "--discovery-source-download-max-bytes",
+        type=_parse_optional_byte_cap,
+        default=0,
+        help=(
+            "Maximum bytes for automatic source downloads during discovery "
+            "(default: 0, unlimited; accepts sizes like 1GB or 1GiB)."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-source-download-timeout-seconds",
+        type=int,
+        default=60,
+        help="Timeout for automatic source downloads during discovery.",
+    )
+
+
+def _runtime_discovery_settings_from_args(
+    args: argparse.Namespace,
+    *,
+    paths: WorkspacePaths,
+) -> RuntimeDiscoverySettings | None:
+    mode = normalize_discovery_mode(getattr(args, "discovery_mode", "none"))
+    if mode == "none":
+        return None
+    command = str(getattr(args, "discovery_command", "") or "").strip()
+    package_specs = tuple(str(value).strip() for value in getattr(args, "discovery_package", []) if str(value).strip())
+    if not command:
+        command = package_specs[0].split("=", 1)[0] if package_specs else str(args.tool_name)
+    if not package_specs:
+        package_specs = (command,)
+    return RuntimeDiscoverySettings(
+        mode=mode,
+        package_specs=package_specs,
+        command=command,
+        channels=tuple(getattr(args, "discovery_channel", []) or DEFAULT_DISCOVERY_CHANNELS),
+        cache_dir=Path(args.discovery_cache_dir).resolve()
+        if str(getattr(args, "discovery_cache_dir", "") or "").strip()
+        else paths.cache_root / "generation" / "runtime-discovery",
+        env_dir=Path(args.discovery_env_dir).resolve()
+        if str(getattr(args, "discovery_env_dir", "") or "").strip()
+        else None,
+        conda_executable=str(getattr(args, "discovery_conda_executable", "") or ""),
+        conda_timeout_seconds=int(getattr(args, "discovery_conda_timeout_seconds", 900)),
+        discover_subcommands=bool(getattr(args, "discover_subcommands", True)),
+        max_discovered_subcommands=int(getattr(args, "max_discovered_subcommands", 8)),
+        container_runtime=str(getattr(args, "discovery_container_runtime", "auto") or "auto"),
+        container_cache_dir=Path(args.discovery_container_cache_dir).resolve()
+        if str(getattr(args, "discovery_container_cache_dir", "") or "").strip()
+        else paths.cache_root / "containers",
+        docker_use_sudo=bool(getattr(args, "discovery_docker_use_sudo", False)),
+        container_help_probe_mode=str(
+            getattr(args, "discovery_container_help_probe_mode", "exploratory") or "exploratory"
+        ),
+        container_timeout_seconds=int(getattr(args, "discovery_container_timeout_seconds", 120)),
+        bioconda_ref=str(getattr(args, "discovery_bioconda_ref", "master") or "master"),
+        source_download_max_bytes=int(getattr(args, "discovery_source_download_max_bytes", 0)),
+        source_download_timeout_seconds=int(
+            getattr(args, "discovery_source_download_timeout_seconds", 60)
+        ),
+    )
+
+
+def _run_runtime_discovery_from_args(
+    args: argparse.Namespace,
+    *,
+    paths: WorkspacePaths,
+) -> RuntimeDiscoveryResult | None:
+    settings = _runtime_discovery_settings_from_args(args, paths=paths)
+    if settings is None:
+        return None
+    print(
+        f"Runtime discovery: mode={settings.mode} command={settings.command} "
+        f"packages={','.join(settings.package_specs)}",
+        file=sys.stderr,
+    )
+    result = discover_runtime_context(paths=paths, settings=settings)
+    if result.has_help:
+        print(
+            f"Runtime discovery accepted help from {result.selected_runtime or result.mode}.",
+            file=sys.stderr,
+        )
+    elif result.errors:
+        print(
+            "Runtime discovery did not collect accepted help: "
+            + "; ".join(result.errors[:3]),
+            file=sys.stderr,
+        )
+    return result
+
+
+def _generation_help_text_from_args(
+    args: argparse.Namespace,
+    discovery: RuntimeDiscoveryResult | None,
+) -> str:
+    parts: list[str] = []
+    help_text_file = str(getattr(args, "help_text_file", "") or "").strip()
+    if help_text_file:
+        parts.append(Path(help_text_file).resolve().read_text(encoding="utf-8"))
+    if discovery is not None and discovery.combined_help_text.strip():
+        parts.append(discovery.combined_help_text)
+    if not parts:
+        raise ValueError("--help-text-file is required unless --discovery-mode produces help.")
+    return "\n\n".join(part.strip() for part in parts if part.strip())
+
+
+def _suite_generation_help_text_from_args(
+    args: argparse.Namespace,
+    discovery: RuntimeDiscoveryResult | None,
+) -> str:
+    parts: list[str] = []
+    help_text_file = str(getattr(args, "help_text_file", "") or "").strip()
+    if help_text_file:
+        parts.append(Path(help_text_file).resolve().read_text(encoding="utf-8"))
+    if discovery is not None and discovery.top_level_help.strip():
+        parts.append(
+            "Runtime-discovered top-level command help:\n\n"
+            + discovery.top_level_help.strip()
+        )
+    elif discovery is not None and discovery.combined_help_text.strip():
+        parts.append(discovery.combined_help_text)
+    if not parts:
+        raise ValueError("--help-text-file is required unless --discovery-mode produces help.")
+    return "\n\n".join(part.strip() for part in parts if part.strip())
+
+
+def _help_text_path_from_args(args: argparse.Namespace) -> Path | None:
+    help_text_file = str(getattr(args, "help_text_file", "") or "").strip()
+    return Path(help_text_file).resolve() if help_text_file else None
+
+
+def _source_root_override(
+    args: argparse.Namespace,
+    *,
+    source_archive_root: Path | None,
+    discovery: RuntimeDiscoveryResult | None,
+) -> Path | None:
+    if source_archive_root is not None:
+        return source_archive_root
+    if str(getattr(args, "source_root", "") or "").strip():
+        return None
+    if discovery is not None and discovery.source_root:
+        return Path(discovery.source_root).resolve()
+    return None
+
+
+def _add_shed_metadata_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--shed-name", default="", help="Tool Shed repository name override.")
+    parser.add_argument("--shed-owner", default="", help="Tool Shed owner metadata.")
+    parser.add_argument("--shed-description", default="", help="Tool Shed repository description.")
+    parser.add_argument(
+        "--shed-category",
+        action="append",
+        default=[],
+        help="Tool Shed category; repeat to include multiple categories.",
+    )
+    parser.add_argument(
+        "--shed-homepage-url",
+        default="",
+        help="Tool Shed homepage_url metadata.",
+    )
+    parser.add_argument(
+        "--shed-remote-repository-url",
+        default="",
+        help="Tool Shed remote_repository_url metadata.",
+    )
+    parser.add_argument(
+        "--no-shed-yml",
+        action="store_true",
+        help="Do not write .shed.yml in repository bundle output modes.",
+    )
+
+
+def _shed_metadata_from_args(
+    args: argparse.Namespace,
+    *,
+    default_name: str,
+    default_description: str,
+    suite: bool = False,
+    repositories: list[str] | tuple[str, ...] | None = None,
+):
+    return build_tool_shed_metadata(
+        name=str(getattr(args, "shed_name", "") or "").strip() or default_name,
+        owner=str(getattr(args, "shed_owner", "") or "").strip(),
+        description=str(getattr(args, "shed_description", "") or "").strip()
+        or default_description,
+        homepage_url=str(getattr(args, "shed_homepage_url", "") or "").strip(),
+        remote_repository_url=str(getattr(args, "shed_remote_repository_url", "") or "").strip(),
+        categories=list(getattr(args, "shed_category", []) or []),
+        suite=suite,
+        repositories=repositories or (),
+    )
+
+
+def _repository_output_path(
+    *,
+    repository_output_dir: Path | None,
+    output_value: str,
+    tool_name: str,
+) -> Path:
+    if repository_output_dir is None:
+        if not str(output_value).strip():
+            raise ValueError("--output is required unless --repository-output-dir is provided.")
+        return Path(output_value).resolve()
+    repository_output_dir = repository_output_dir.resolve()
+    output_text = str(output_value or "").strip()
+    if not output_text:
+        return repository_output_dir / f"{safe_tool_id(tool_name)}.xml"
+    output_path = Path(output_text)
+    if output_path.is_absolute():
+        raise ValueError("--output must be relative when --repository-output-dir is used.")
+    return repository_output_dir / output_path
 
 
 def _planemo_test_options_from_args(args: argparse.Namespace) -> PlanemoTestOptions:
@@ -282,6 +639,86 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "estimate-model-resources",
         help="Print resource/cost estimate tiers for model profiles.",
+    )
+    estimate_tokens_parser = subparsers.add_parser(
+        "estimate-training-tokens",
+        help="Estimate training sample sizes across context-length candidates.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--profile",
+        default="agentic-devstral-24b",
+        help="Training profile name from config/training.profiles.json.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--corpus-jsonl",
+        default=".gtsm-cache/datasets/tools-iuc-corpus.jsonl",
+        help="Training corpus JSONL path.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--artifact-format",
+        choices=["xml", "udt-yaml", "mixed"],
+        default="xml",
+        help="Training target format to estimate.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--max-seq-lengths",
+        default=",".join(str(value) for value in DEFAULT_CONTEXT_LENGTHS),
+        help="Comma-separated context lengths to check; k suffix means 1024 tokens.",
+    )
+    _add_source_context_args(
+        estimate_tokens_parser,
+        include_source_root=True,
+        include_source_file=True,
+    )
+    estimate_tokens_parser.add_argument(
+        "--compare-source-context-modes",
+        default="",
+        help="Comma-separated source-context modes to compare, e.g. all-filtered,all-raw.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--source-context-budget-ladder",
+        action="store_true",
+        help="Use the built-in source char/file budget ladder for each context length.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional corpus-record limit for quick estimates; 0 means the full corpus.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--exact-tokenizer",
+        action="store_true",
+        help="Use the profile tokenizer from the local model cache instead of char estimates.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--chars-per-token",
+        type=float,
+        default=3.7,
+        help="Approximate characters per token when not using --exact-tokenizer.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100,
+        help="Print estimator progress every N corpus records; 0 disables progress.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Estimator worker threads. 0 uses an automatic bounded worker count.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--longest-sample-count",
+        type=int,
+        default=25,
+        help="Number of longest training samples to include per source-context estimate.",
+    )
+    estimate_tokens_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output. This is currently the default output format.",
     )
     subparsers.add_parser(
         "list-promotion-policies", help="List configured promotion policy profiles."
@@ -612,6 +1049,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Override the profile max sequence length for this run.",
     )
+    train_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Stop training after this many optimizer steps; useful for memory probes.",
+    )
     pad_group = train_parser.add_mutually_exclusive_group()
     pad_group.add_argument(
         "--pad-to-sequence-len",
@@ -769,7 +1211,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "convert-adapter",
         help="Convert supported adapter artifacts between local formats.",
     )
-    convert_adapter_parser.add_argument("--from", dest="from_format", choices=["mlx"], required=True)
+    convert_adapter_parser.add_argument(
+        "--from", dest="from_format", choices=["mlx"], required=True
+    )
     convert_adapter_parser.add_argument("--to", dest="to_format", choices=["peft"], required=True)
     convert_adapter_parser.add_argument(
         "--base-model",
@@ -792,7 +1236,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Generate a Galaxy tool artifact from help text and optional source code.",
     )
     generate_parser.add_argument("--tool-name", required=True, help="Tool identifier/name.")
-    generate_parser.add_argument("--help-text-file", required=True, help="Path to help text file.")
+    generate_parser.add_argument(
+        "--tool-id",
+        default="",
+        help="Optional Galaxy tool id. Defaults to a safe id derived from --tool-name.",
+    )
+    generate_parser.add_argument("--help-text-file", default="", help="Path to help text file.")
+    _add_runtime_discovery_args(generate_parser)
     generate_parser.add_argument(
         "--artifact-format",
         choices=["xml", "udt-yaml"],
@@ -800,9 +1250,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Artifact format to generate.",
     )
     generate_parser.add_argument(
+        "--tool-granularity",
+        choices=["single", "subcommands", "suite", "auto"],
+        default="auto",
+        help=(
+            "Generation granularity hint. Current generate-wrapper output remains one primary "
+            "tool XML; suite/subcommand hints are recorded for prompt and monitor metadata."
+        ),
+    )
+    generate_parser.add_argument(
         "--source-file", help="Optional source code file to provide extra context."
     )
-    _add_source_context_args(generate_parser, include_source_root=True)
+    source_root_group = generate_parser.add_mutually_exclusive_group()
+    _add_source_context_args(
+        generate_parser,
+        include_source_root=True,
+        source_root_target=source_root_group,
+    )
+    source_root_group.add_argument(
+        "--source-archive",
+        default="",
+        help=(
+            "Optional local source archive path or HTTP(S)/FTP URL to download, "
+            "extract, and scan for source context."
+        ),
+    )
+    generate_parser.add_argument(
+        "--source-archive-max-bytes",
+        type=_parse_optional_byte_cap,
+        default=DEFAULT_SOURCE_ARCHIVE_MAX_BYTES,
+        help=(
+            "Maximum bytes for one manual source archive "
+            "(default: 1GB; accepts sizes like 512MB or 1GiB; use 0 for unlimited)."
+        ),
+    )
+    generate_parser.add_argument(
+        "--source-archive-timeout-seconds",
+        type=int,
+        default=DEFAULT_SOURCE_ARCHIVE_TIMEOUT_SECONDS,
+        help="Timeout for manual source archive URL downloads.",
+    )
     generate_parser.add_argument(
         "--provider",
         choices=["local", "openai", "anthropic", "copilot", "ollama"],
@@ -827,6 +1314,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max output tokens for external providers.",
     )
     generate_parser.add_argument(
+        "--ollama-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Ollama runtime context tokens (num_ctx). "
+            "Unset uses GTSM_OLLAMA_CONTEXT_TOKENS or Ollama defaults; 0 disables num_ctx."
+        ),
+    )
+    generate_parser.add_argument(
         "--max-prompt-help-chars",
         type=int,
         default=DEFAULT_MAX_PROMPT_HELP_CHARS,
@@ -847,7 +1343,188 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow the local provider to return canned starter XML when no real local model is configured.",
     )
-    generate_parser.add_argument("--output", required=True, help="Output artifact path.")
+    generate_parser.add_argument(
+        "--repair-invalid-xml",
+        dest="repair_invalid_xml",
+        action="store_true",
+        default=True,
+        help="Retry malformed, non-tool, truncated, or degenerate XML once with a stricter repair prompt.",
+    )
+    generate_parser.add_argument(
+        "--no-repair-invalid-xml",
+        dest="repair_invalid_xml",
+        action="store_false",
+        help="Disable automatic one-shot repair for invalid generated XML.",
+    )
+    generate_parser.add_argument(
+        "--stream-output",
+        action="store_true",
+        help="For local HF/PEFT generation, stream decoded model text to stderr while generating.",
+    )
+    generate_parser.add_argument(
+        "--raw-response-log",
+        default="",
+        help="Optional path for the full unstripped raw model response.",
+    )
+    generate_parser.add_argument(
+        "--generate-sidecars",
+        action="store_true",
+        help="Write companion sidecar XML blocks from the raw response alongside the primary tool XML.",
+    )
+    generate_parser.add_argument(
+        "--no-toolsmith-citation",
+        dest="include_toolsmith_citation",
+        action="store_false",
+        default=True,
+        help="Do not add the deterministic Galaxy Toolsmith citation to generated artifacts.",
+    )
+    generate_parser.add_argument(
+        "--no-datatype-scaffold",
+        dest="datatype_scaffold",
+        action="store_false",
+        default=True,
+        help="Do not write datatype placeholder scaffolds for unknown Galaxy datatypes.",
+    )
+    generate_parser.add_argument(
+        "--sidecar-output-dir",
+        default="",
+        help="Directory for generated sidecar files (default: <output>.sidecars/).",
+    )
+    generate_parser.add_argument(
+        "--repository-output-dir",
+        default="",
+        help=(
+            "Optional Tool Shed-style repository directory. When set, the generated XML, "
+            ".shed.yml, sidecars, and .gtsm metadata are written into this directory."
+        ),
+    )
+    _add_shed_metadata_args(generate_parser)
+    generate_parser.add_argument(
+        "--output",
+        default="",
+        help="Output artifact path. Required unless --repository-output-dir is provided.",
+    )
+
+    plan_suite_parser = subparsers.add_parser(
+        "plan-suite",
+        help="Inspect help/source context and produce a proposed multi-tool suite plan.",
+    )
+    plan_suite_parser.add_argument("--tool-name", required=True, help="Tool identifier/name.")
+    plan_suite_parser.add_argument("--help-text-file", default="", help="Path to help text file.")
+    _add_runtime_discovery_args(plan_suite_parser)
+    plan_suite_parser.add_argument("--source-file", default="", help="Optional source code file.")
+    plan_suite_parser.add_argument(
+        "--max-suite-tools",
+        type=int,
+        default=8,
+        help="Maximum suite members to include in the proposed plan.",
+    )
+    plan_suite_parser.add_argument(
+        "--force-suite",
+        action="store_true",
+        help="Return a suite-style plan even when only one tool is detected.",
+    )
+
+    suite_parser = subparsers.add_parser(
+        "generate-suite",
+        help="Generate a Tool Shed-style repository bundle containing multiple tool wrappers.",
+    )
+    suite_parser.add_argument("--tool-name", required=True, help="Tool/package name.")
+    suite_parser.add_argument("--help-text-file", default="", help="Path to help text file.")
+    _add_runtime_discovery_args(suite_parser)
+    suite_parser.add_argument("--source-file", default="", help="Optional source code file.")
+    suite_source_root_group = suite_parser.add_mutually_exclusive_group()
+    _add_source_context_args(
+        suite_parser,
+        include_source_root=True,
+        source_root_target=suite_source_root_group,
+    )
+    suite_source_root_group.add_argument(
+        "--source-archive",
+        default="",
+        help="Optional local source archive path or HTTP(S)/FTP URL to extract and scan.",
+    )
+    suite_parser.add_argument(
+        "--source-archive-max-bytes",
+        type=_parse_optional_byte_cap,
+        default=DEFAULT_SOURCE_ARCHIVE_MAX_BYTES,
+        help="Maximum bytes for one manual source archive (default: 1GB; use 0 for unlimited).",
+    )
+    suite_parser.add_argument(
+        "--source-archive-timeout-seconds",
+        type=int,
+        default=DEFAULT_SOURCE_ARCHIVE_TIMEOUT_SECONDS,
+        help="Timeout for manual source archive URL downloads.",
+    )
+    suite_parser.add_argument(
+        "--provider",
+        choices=["local", "openai", "anthropic", "copilot", "ollama"],
+        default="local",
+        help="Generation provider.",
+    )
+    suite_parser.add_argument("--model", default="", help="Provider model name override.")
+    suite_parser.add_argument("--model-variant", default="suite-variant")
+    suite_parser.add_argument("--skills-profile", default="default")
+    suite_parser.add_argument("--temperature", type=float, default=0.1)
+    suite_parser.add_argument("--max-tokens", type=int, default=4096)
+    suite_parser.add_argument(
+        "--ollama-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Ollama runtime context tokens (num_ctx). "
+            "Unset uses GTSM_OLLAMA_CONTEXT_TOKENS or Ollama defaults; 0 disables num_ctx."
+        ),
+    )
+    suite_parser.add_argument("--max-prompt-help-chars", type=int, default=DEFAULT_MAX_PROMPT_HELP_CHARS)
+    suite_parser.add_argument("--allow-stub-local", action="store_true")
+    suite_parser.add_argument(
+        "--local-offload-policy",
+        choices=["allow", "fail"],
+        default="allow",
+        help="Whether local PEFT suite generation may use CPU/disk/model offload.",
+    )
+    suite_parser.add_argument(
+        "--local-gpu-memory-reserve-gib",
+        type=float,
+        default=2.0,
+        help="GiB to reserve per visible GPU when computing local PEFT max_memory.",
+    )
+    suite_parser.add_argument("--output-dir", required=True, help="Repository bundle output directory.")
+    suite_parser.add_argument("--max-suite-tools", type=int, default=8)
+    suite_parser.add_argument("--generate-sidecars", action="store_true", default=True)
+    suite_parser.add_argument("--no-generate-sidecars", dest="generate_sidecars", action="store_false")
+    suite_parser.add_argument(
+        "--no-toolsmith-citation",
+        dest="include_toolsmith_citation",
+        action="store_false",
+        default=True,
+        help="Do not add the deterministic Galaxy Toolsmith citation to generated tools.",
+    )
+    suite_parser.add_argument(
+        "--no-datatype-scaffold",
+        dest="datatype_scaffold",
+        action="store_false",
+        default=True,
+        help="Do not write datatype placeholder scaffolds for unknown Galaxy datatypes.",
+    )
+    suite_parser.add_argument("--raw-response-logs", action="store_true")
+    suite_parser.add_argument("--stream-output", action="store_true")
+    suite_parser.add_argument("--repair-invalid-xml", dest="repair_invalid_xml", action="store_true", default=True)
+    suite_parser.add_argument("--no-repair-invalid-xml", dest="repair_invalid_xml", action="store_false")
+    _add_shed_metadata_args(suite_parser)
+
+    compare_generation_parser = subparsers.add_parser(
+        "compare-generation-runs",
+        help="Compare two generated-suite run directories using their generation records.",
+    )
+    compare_generation_parser.add_argument("--left-run-dir", required=True)
+    compare_generation_parser.add_argument("--right-run-dir", required=True)
+    compare_generation_parser.add_argument(
+        "--output",
+        default="",
+        help="Optional comparison JSON path; defaults to LEFT/.gtsm/generation-comparison.json.",
+    )
 
     server_parser = subparsers.add_parser(
         "serve",
@@ -869,6 +1546,15 @@ def _build_parser() -> argparse.ArgumentParser:
     server_parser.add_argument("--model-variant", default="server-default")
     server_parser.add_argument("--temperature", type=float, default=0.1)
     server_parser.add_argument("--max-tokens", type=int, default=4096)
+    server_parser.add_argument(
+        "--ollama-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Ollama runtime context tokens (num_ctx). "
+            "Unset uses GTSM_OLLAMA_CONTEXT_TOKENS or Ollama defaults; 0 disables num_ctx."
+        ),
+    )
     server_parser.add_argument(
         "--max-prompt-help-chars",
         type=int,
@@ -962,6 +1648,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Environment variable containing optional bearer auth token.",
     )
     remote_parser.add_argument("--tool-name", required=True)
+    remote_parser.add_argument(
+        "--tool-id",
+        default="",
+        help="Optional Galaxy tool id. Defaults to a safe id derived from --tool-name.",
+    )
     remote_parser.add_argument("--help-text-file", required=True)
     remote_parser.add_argument("--source-file")
     remote_parser.add_argument(
@@ -986,7 +1677,67 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_PROMPT_HELP_CHARS,
         help="Maximum help-text characters included in the remote generation prompt.",
     )
+    remote_parser.add_argument(
+        "--no-toolsmith-citation",
+        dest="include_toolsmith_citation",
+        action="store_false",
+        default=True,
+    )
+    remote_parser.add_argument(
+        "--no-datatype-scaffold",
+        dest="datatype_scaffold",
+        action="store_false",
+        default=True,
+    )
     remote_parser.add_argument("--output", required=True)
+
+    remote_suite_parser = subparsers.add_parser(
+        "generate-suite-remote",
+        help="Generate a repository bundle using the remote server suite endpoint.",
+    )
+    remote_suite_parser.add_argument("--server-url", default="http://127.0.0.1:8765")
+    remote_suite_parser.add_argument(
+        "--auth-token-env",
+        default="GTSM_SERVER_AUTH_TOKEN",
+        help="Environment variable containing optional bearer auth token.",
+    )
+    remote_suite_parser.add_argument("--tool-name", required=True)
+    remote_suite_parser.add_argument("--help-text-file", required=True)
+    remote_suite_parser.add_argument("--source-file", default="")
+    remote_suite_parser.add_argument(
+        "--provider",
+        choices=["local", "openai", "anthropic", "copilot", "ollama"],
+        default="local",
+    )
+    remote_suite_parser.add_argument("--model", default="")
+    remote_suite_parser.add_argument("--model-variant", default="remote-suite-variant")
+    remote_suite_parser.add_argument("--skills-profile", default="default")
+    remote_suite_parser.add_argument("--temperature", type=float, default=0.1)
+    remote_suite_parser.add_argument("--max-tokens", type=int, default=4096)
+    remote_suite_parser.add_argument(
+        "--max-prompt-help-chars",
+        type=int,
+        default=DEFAULT_MAX_PROMPT_HELP_CHARS,
+    )
+    remote_suite_parser.add_argument("--max-suite-tools", type=int, default=8)
+    remote_suite_parser.add_argument("--output-dir", required=True)
+    remote_suite_parser.add_argument("--generate-sidecars", action="store_true", default=True)
+    remote_suite_parser.add_argument("--no-generate-sidecars", dest="generate_sidecars", action="store_false")
+    remote_suite_parser.add_argument(
+        "--no-toolsmith-citation",
+        dest="include_toolsmith_citation",
+        action="store_false",
+        default=True,
+    )
+    remote_suite_parser.add_argument(
+        "--no-datatype-scaffold",
+        dest="datatype_scaffold",
+        action="store_false",
+        default=True,
+    )
+    remote_suite_parser.add_argument("--repair-invalid-xml", dest="repair_invalid_xml", action="store_true", default=True)
+    remote_suite_parser.add_argument("--no-repair-invalid-xml", dest="repair_invalid_xml", action="store_false")
+    _add_shed_metadata_args(remote_suite_parser)
 
     convert_udt_parser = subparsers.add_parser(
         "convert-udt",
@@ -1183,6 +1934,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bench_parser.add_argument("--max-tokens", type=int, default=4096, help="Max output tokens.")
     bench_parser.add_argument(
+        "--ollama-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Ollama runtime context tokens (num_ctx). "
+            "Unset uses GTSM_OLLAMA_CONTEXT_TOKENS or Ollama defaults; 0 disables num_ctx."
+        ),
+    )
+    bench_parser.add_argument(
         "--max-workers", type=int, default=4, help="Parallel workers for generation."
     )
     bench_parser.add_argument(
@@ -1252,6 +2012,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum help-text characters included in each generation prompt.",
     )
     _add_source_context_args(bench_parser, include_source_root=True)
+    bench_parser.add_argument(
+        "--suite-generation",
+        choices=["single", "recommend", "generate"],
+        default="single",
+        help=(
+            "Suite handling for benchmark records: single keeps one wrapper, recommend records "
+            "a suite plan, generate writes repository bundles and evaluates all generated XMLs."
+        ),
+    )
+    bench_parser.add_argument(
+        "--max-suite-tools",
+        type=int,
+        default=8,
+        help="Maximum suite members when --suite-generation is recommend or generate.",
+    )
     bench_parser.add_argument(
         "--repair-invalid-xml",
         dest="repair_invalid_xml",
@@ -1894,6 +2669,36 @@ def main() -> int:
         print(model_estimates_json())
         return 0
 
+    if args.command == "estimate-training-tokens":
+        profile_path = paths.configs_root / "training.profiles.json"
+        if not profile_path.exists():
+            write_default_training_profiles(profile_path)
+        profile = load_training_profile(profile_path, args.profile)
+        source_context = _source_context_settings_from_args(args)
+        context_lengths = parse_context_lengths(args.max_seq_lengths)
+        source_modes = parse_source_context_modes(
+            args.compare_source_context_modes,
+            default=source_context.mode,
+        )
+        result = estimate_training_tokens(
+            profile=profile,
+            corpus_jsonl_path=Path(args.corpus_jsonl).resolve(),
+            repo_root=paths.repo_root,
+            artifact_format=args.artifact_format,
+            source_context_settings=source_context,
+            source_context_modes=source_modes,
+            max_seq_lengths=context_lengths,
+            source_context_budget_ladder=bool(args.source_context_budget_ladder),
+            limit=int(args.limit) if int(args.limit or 0) > 0 else None,
+            exact_tokenizer=bool(args.exact_tokenizer),
+            chars_per_token=float(args.chars_per_token),
+            progress_interval=max(0, int(args.progress_interval)),
+            workers=int(args.workers),
+            longest_sample_count=max(0, int(args.longest_sample_count)),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.command == "list-promotion-policies":
         policy_path = paths.configs_root / "promotion.policies.json"
         if not policy_path.exists():
@@ -2180,6 +2985,7 @@ def main() -> int:
                         if args.learning_rate is not None
                         else profile.learning_rate
                     ),
+                    "max_steps": args.max_steps,
                     "variant_id": args.variant_id,
                     "source_context": source_context.to_dict(),
                 },
@@ -2216,6 +3022,7 @@ def main() -> int:
                 stream_logs=args.stream_logs,
                 log_tail_lines=args.log_tail_lines,
                 source_context_settings=source_context,
+                max_steps=args.max_steps,
             )
         except Exception as error:
             if tracker is not None:
@@ -2243,6 +3050,7 @@ def main() -> int:
                 )
                 hook_summary["export"] = json.loads(export_result.to_json())
             if args.post_ollama_model_name:
+                normalized_ollama_name = normalize_ollama_model_name(args.post_ollama_model_name)
                 modelfile_path = write_ollama_modelfile(
                     paths=paths,
                     variant_id=variant_id,
@@ -2252,12 +3060,15 @@ def main() -> int:
                 update_variant_ollama_metadata(
                     paths=paths,
                     variant_id=variant_id,
-                    ollama_model_name=args.post_ollama_model_name,
+                    ollama_model_name=normalized_ollama_name.effective,
                     ollama_modelfile_path=str(modelfile_path),
+                    requested_ollama_model_name=normalized_ollama_name.requested,
                     export_quantizations=quantizations if args.post_export_quantizations else None,
                 )
                 hook_summary["ollama_modelfile"] = str(modelfile_path)
-                hook_summary["ollama_model_name"] = args.post_ollama_model_name
+                hook_summary["ollama_model_name"] = normalized_ollama_name.effective
+                if normalized_ollama_name.changed:
+                    hook_summary["requested_ollama_model_name"] = normalized_ollama_name.requested
                 if args.post_ollama_create:
                     hook_summary["ollama_create"] = create_ollama_model(
                         modelfile_path=modelfile_path,
@@ -2300,7 +3111,7 @@ def main() -> int:
             )
         if should_print:
             print(run.to_json())
-        return 0
+        return 0 if run.status in {"completed", "dry-run"} else 1
 
     if args.command == "train-remote-submit":
         auth_token = os.getenv(args.auth_token_env)
@@ -2551,13 +3362,15 @@ def main() -> int:
 
     if args.command == "export-ollama-model":
         paths.create_directories()
+        normalized_ollama_name = normalize_ollama_model_name(args.model_name)
         tracker = create_monitor_run_tracker(
             paths,
             kind="export",
             command=_monitor_command(),
             inputs={
                 "variant_id": args.variant_id,
-                "model_name": args.model_name,
+                "model_name": normalized_ollama_name.effective,
+                "requested_ollama_model_name": normalized_ollama_name.requested,
                 "from_quantization": args.from_quantization,
                 "create": args.create,
             },
@@ -2572,15 +3385,18 @@ def main() -> int:
             update_variant_ollama_metadata(
                 paths=paths,
                 variant_id=args.variant_id,
-                ollama_model_name=args.model_name,
+                ollama_model_name=normalized_ollama_name.effective,
                 ollama_modelfile_path=str(modelfile_path),
+                requested_ollama_model_name=normalized_ollama_name.requested,
                 export_quantizations=[args.from_quantization],
             )
             payload: dict = {
                 "variant_id": args.variant_id,
-                "model_name": args.model_name,
+                "model_name": normalized_ollama_name.effective,
                 "modelfile_path": str(modelfile_path),
             }
+            if normalized_ollama_name.changed:
+                payload["requested_ollama_model_name"] = normalized_ollama_name.requested
             if args.create:
                 payload["create"] = create_ollama_model(
                     modelfile_path=modelfile_path, model_name=args.model_name
@@ -2589,7 +3405,8 @@ def main() -> int:
                 outputs={"modelfile_path": str(modelfile_path)},
                 summary={
                     "variant_id": args.variant_id,
-                    "model_name": args.model_name,
+                    "model_name": normalized_ollama_name.effective,
+                    "requested_ollama_model_name": normalized_ollama_name.requested,
                     "created": bool(args.create),
                 },
             )
@@ -2621,7 +3438,9 @@ def main() -> int:
                     output_dir=Path(args.output_dir).resolve(),
                 )
             else:  # pragma: no cover - parser choices currently prevent this.
-                raise ValueError(f"Unsupported adapter conversion: {args.from_format} -> {args.to_format}")
+                raise ValueError(
+                    f"Unsupported adapter conversion: {args.from_format} -> {args.to_format}"
+                )
             payload = json.loads(result.to_json())
             tracker.complete(
                 outputs={"output_dir": payload.get("output_dir", "")},
@@ -2641,16 +3460,71 @@ def main() -> int:
         paths.create_directories()
         artifact_format = normalize_artifact_format(args.artifact_format)
         source_path = Path(args.source_file).resolve() if args.source_file else None
-        source_context = _source_context_settings_from_args(args)
-        output_path = Path(args.output).resolve()
+        source_archive_resolution = None
+        source_archive_root = None
+        if str(getattr(args, "source_archive", "") or "").strip():
+            source_archive_resolution = resolve_source_archive(
+                str(args.source_archive),
+                cache_root=paths.cache_root / "manual-sources" / "archives",
+                max_bytes=int(args.source_archive_max_bytes),
+                timeout_seconds=int(args.source_archive_timeout_seconds),
+            )
+            source_archive_root = Path(source_archive_resolution.extracted_root).resolve()
+        discovery = _run_runtime_discovery_from_args(args, paths=paths)
+        help_text = _generation_help_text_from_args(args, discovery)
+        source_context = _source_context_settings_from_args(
+            args,
+            source_root=_source_root_override(
+                args,
+                source_archive_root=source_archive_root,
+                discovery=discovery,
+            ),
+        )
+        repository_output_dir = (
+            Path(args.repository_output_dir).resolve()
+            if str(args.repository_output_dir).strip()
+            else None
+        )
+        if repository_output_dir is not None and artifact_format != ARTIFACT_FORMAT_XML:
+            raise ValueError("--repository-output-dir currently supports XML generation only.")
+        output_path = _repository_output_path(
+            repository_output_dir=repository_output_dir,
+            output_value=args.output,
+            tool_name=args.tool_name,
+        )
+        raw_response_log_path = (
+            Path(args.raw_response_log).resolve()
+            if str(args.raw_response_log).strip()
+            else (
+                (
+                    repository_output_dir / ".gtsm" / "raw" / f"{output_path.stem}.log"
+                    if repository_output_dir is not None
+                    else output_path.with_name(f"{output_path.name}.raw-response.log")
+                )
+                if args.stream_output
+                else None
+            )
+        )
+        sidecar_output_dir = (
+            Path(args.sidecar_output_dir).resolve()
+            if str(args.sidecar_output_dir).strip()
+            else (repository_output_dir if repository_output_dir is not None else None)
+        )
         tracker = create_monitor_run_tracker(
             paths,
             kind="inference",
             command=_monitor_command(),
             inputs={
                 "tool_name": args.tool_name,
-                "help_text_file": str(Path(args.help_text_file).resolve()),
+                "tool_id": args.tool_id,
+                "help_text_file": str(_help_text_path_from_args(args) or ""),
                 "source_file": str(source_path) if source_path else "",
+                "source_archive": str(getattr(args, "source_archive", "") or ""),
+                "source_archive_resolution": (
+                    source_archive_resolution.to_dict() if source_archive_resolution else {}
+                ),
+                "runtime_discovery": discovery.to_dict() if discovery else {},
+                "repository_output_dir": str(repository_output_dir or ""),
                 "source_root": str(source_context.source_root or ""),
                 "source_context": source_context.to_dict(),
                 "provider": args.provider,
@@ -2658,9 +3532,18 @@ def main() -> int:
                 "model_variant": args.model_variant,
                 "skills_profile": args.skills_profile,
                 "artifact_format": format_cli_value(artifact_format),
+                "tool_granularity": args.tool_granularity,
                 "temperature": args.temperature,
                 "max_tokens": args.max_tokens,
+                "ollama_context_tokens": args.ollama_context_tokens,
                 "max_prompt_help_chars": args.max_prompt_help_chars,
+                "repair_invalid_xml": args.repair_invalid_xml,
+                "stream_output": args.stream_output,
+                "raw_response_log_path": str(raw_response_log_path or ""),
+                "generate_sidecars": args.generate_sidecars,
+                "sidecar_output_dir": str(sidecar_output_dir or ""),
+                "include_toolsmith_citation": bool(args.include_toolsmith_citation),
+                "datatype_scaffold": bool(args.datatype_scaffold),
             },
             outputs={
                 "output_path": str(output_path),
@@ -2670,13 +3553,17 @@ def main() -> int:
                 "output_udt_yaml_path": str(output_path)
                 if artifact_format == ARTIFACT_FORMAT_UDT_YAML
                 else "",
+                "raw_response_log_path": str(raw_response_log_path or ""),
+                "sidecar_output_dir": str(sidecar_output_dir or ""),
+                "shed_yml_path": str((repository_output_dir / ".shed.yml") if repository_output_dir else ""),
             },
         )
         try:
             record = generate_wrapper(
                 paths=paths,
                 tool_name=args.tool_name,
-                help_text_path=Path(args.help_text_file).resolve(),
+                help_text_path=_help_text_path_from_args(args),
+                help_text=help_text,
                 source_path=source_path,
                 output_path=output_path,
                 provider_name=args.provider,
@@ -2684,19 +3571,65 @@ def main() -> int:
                 model=args.model,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                ollama_context_tokens=args.ollama_context_tokens,
                 skills_profile=args.skills_profile,
                 allow_stub_local=args.allow_stub_local,
                 max_prompt_help_chars=args.max_prompt_help_chars,
                 artifact_format=artifact_format,
                 source_context_settings=source_context,
+                repair_invalid_xml=args.repair_invalid_xml,
+                raw_response_log_path=raw_response_log_path,
+                stream_output=args.stream_output,
+                generate_sidecars=args.generate_sidecars,
+                sidecar_output_dir=sidecar_output_dir,
+                tool_granularity=args.tool_granularity,
+                tool_id=args.tool_id,
+                tool_display_name=args.tool_name,
+                include_toolsmith_citation=bool(args.include_toolsmith_citation),
+                toolsmith_citation_mode=(
+                    "macro"
+                    if repository_output_dir is not None and args.generate_sidecars
+                    else "direct"
+                ),
+                datatype_scaffold=bool(args.datatype_scaffold),
+                datatype_scaffold_dir=repository_output_dir,
+                datatype_scaffold_repository_style=repository_output_dir is not None,
             )
             record_payload = json.loads(record.to_json())
+            shed_yml_path = ""
+            if repository_output_dir is not None:
+                metadata = _shed_metadata_from_args(
+                    args,
+                    default_name=safe_repository_name(args.tool_name),
+                    default_description=f"Generated Galaxy Toolsmith repository for {args.tool_name}",
+                    suite=False,
+                )
+                if not args.no_shed_yml:
+                    shed_yml_path = str(write_shed_yml(repository_output_dir / ".shed.yml", metadata))
+                if discovery is not None:
+                    write_gtsm_json(
+                        repository_output_dir / ".gtsm" / "runtime-discovery.json",
+                        discovery.to_dict(),
+                    )
+                write_gtsm_json(
+                    repository_output_dir / ".gtsm" / "generation-record.json",
+                    {
+                        "record": record_payload,
+                        "shed_metadata": metadata.to_dict(),
+                        "shed_yml_path": shed_yml_path,
+                        "runtime_discovery": discovery.to_dict() if discovery else {},
+                    },
+                )
             tracker.complete(
                 outputs={
                     "output_path": record_payload.get("output_path", str(output_path)),
                     "output_xml_path": record_payload.get("output_xml_path", str(output_path)),
                     "output_udt_yaml_path": record_payload.get("output_udt_yaml_path", ""),
                     "report_path": record_payload.get("report_path", ""),
+                    "raw_response_log_path": record_payload.get("raw_response_log_path", ""),
+                    "sidecar_artifacts": record_payload.get("sidecar_artifacts", []),
+                    "datatype_scaffold": record_payload.get("datatype_scaffold", {}),
+                    "shed_yml_path": shed_yml_path,
                 },
                 summary={
                     "provider": record_payload.get("provider", args.provider),
@@ -2709,6 +3642,154 @@ def main() -> int:
         except Exception as error:
             tracker.fail(error)
             raise
+
+    if args.command == "plan-suite":
+        paths.create_directories()
+        discovery = _run_runtime_discovery_from_args(args, paths=paths)
+        help_text = _suite_generation_help_text_from_args(args, discovery)
+        source_code = (
+            Path(args.source_file).resolve().read_text(encoding="utf-8")
+            if str(args.source_file).strip()
+            else ""
+        )
+        plan = plan_suite_from_content(
+            tool_name=args.tool_name,
+            help_text=help_text,
+            source_code=source_code,
+            max_suite_tools=args.max_suite_tools,
+            force_suite=args.force_suite,
+        )
+        print(plan.to_json())
+        return 0
+
+    if args.command == "generate-suite":
+        paths.create_directories()
+        source_archive_resolution = None
+        source_archive_root = None
+        if str(getattr(args, "source_archive", "") or "").strip():
+            source_archive_resolution = resolve_source_archive(
+                str(args.source_archive),
+                cache_root=paths.cache_root / "manual-sources" / "archives",
+                max_bytes=int(args.source_archive_max_bytes),
+                timeout_seconds=int(args.source_archive_timeout_seconds),
+            )
+            source_archive_root = Path(source_archive_resolution.extracted_root).resolve()
+        discovery = _run_runtime_discovery_from_args(args, paths=paths)
+        help_text = _suite_generation_help_text_from_args(args, discovery)
+        source_context = _source_context_settings_from_args(
+            args,
+            source_root=_source_root_override(
+                args,
+                source_archive_root=source_archive_root,
+                discovery=discovery,
+            ),
+        )
+        output_dir = Path(args.output_dir).resolve()
+        metadata = _shed_metadata_from_args(
+            args,
+            default_name=f"suite_{safe_repository_name(args.tool_name)}",
+            default_description=f"Generated Galaxy Toolsmith suite for {args.tool_name}",
+            suite=True,
+            repositories=[],
+        )
+        tracker = create_monitor_run_tracker(
+            paths,
+            kind="inference",
+            command=_monitor_command(),
+            inputs={
+                "tool_name": args.tool_name,
+                "help_text_file": str(_help_text_path_from_args(args) or ""),
+                "source_file": str(Path(args.source_file).resolve()) if args.source_file else "",
+                "source_archive": str(getattr(args, "source_archive", "") or ""),
+                "source_archive_resolution": (
+                    source_archive_resolution.to_dict() if source_archive_resolution else {}
+                ),
+                "runtime_discovery": discovery.to_dict() if discovery else {},
+                "source_context": source_context.to_dict(),
+                "provider": args.provider,
+                "model": args.model,
+                "model_variant": args.model_variant,
+                "skills_profile": args.skills_profile,
+                "temperature": args.temperature,
+                "max_tokens": args.max_tokens,
+                "ollama_context_tokens": args.ollama_context_tokens,
+                "local_offload_policy": args.local_offload_policy,
+                "local_gpu_memory_reserve_gib": args.local_gpu_memory_reserve_gib,
+                "max_suite_tools": args.max_suite_tools,
+                "generate_sidecars": args.generate_sidecars,
+                "include_toolsmith_citation": bool(args.include_toolsmith_citation),
+                "datatype_scaffold": bool(args.datatype_scaffold),
+                "raw_response_logs": args.raw_response_logs,
+                "stream_output": args.stream_output,
+                "repair_invalid_xml": args.repair_invalid_xml,
+                "write_shed": not args.no_shed_yml,
+            },
+            outputs={"output_dir": str(output_dir)},
+        )
+        try:
+            record = generate_suite(
+                paths=paths,
+                tool_name=args.tool_name,
+                help_text_path=_help_text_path_from_args(args),
+                help_text=help_text,
+                source_path=Path(args.source_file).resolve() if args.source_file else None,
+                output_dir=output_dir,
+                provider_name=args.provider,
+                model_variant=args.model_variant,
+                model=args.model,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                ollama_context_tokens=args.ollama_context_tokens,
+                skills_profile=args.skills_profile,
+                allow_stub_local=args.allow_stub_local,
+                max_prompt_help_chars=args.max_prompt_help_chars,
+                local_offload_policy=args.local_offload_policy,
+                local_gpu_memory_reserve_gib=args.local_gpu_memory_reserve_gib,
+                source_context_settings=source_context,
+                max_suite_tools=args.max_suite_tools,
+                generate_sidecars=args.generate_sidecars,
+                raw_response_logs=args.raw_response_logs,
+                stream_output=args.stream_output,
+                repair_invalid_xml=args.repair_invalid_xml,
+                shed_metadata=metadata,
+                write_shed=not args.no_shed_yml,
+                subcommand_help=dict(discovery.subcommand_help) if discovery else None,
+                include_toolsmith_citation=bool(args.include_toolsmith_citation),
+                datatype_scaffold=bool(args.datatype_scaffold),
+            )
+            if discovery is not None:
+                write_gtsm_json(output_dir / ".gtsm" / "runtime-discovery.json", discovery.to_dict())
+            payload = record.to_dict()
+            tracker.complete(
+                outputs={
+                    "output_dir": payload.get("output_dir", str(output_dir)),
+                    "shed_yml_path": payload.get("shed_yml_path", ""),
+                    "generated_files": payload.get("generated_files", []),
+                    "manifest_path": payload.get("manifest_path", ""),
+                },
+                summary={
+                    "suite_plan": payload.get("suite_plan", {}),
+                    "generated_file_count": len(payload.get("generated_files", [])),
+                    "warnings": payload.get("warnings", []),
+                },
+            )
+            print(record.to_json())
+            return 0
+        except Exception as error:
+            tracker.fail(error)
+            raise
+
+    if args.command == "compare-generation-runs":
+        left_run_dir = Path(args.left_run_dir).resolve()
+        right_run_dir = Path(args.right_run_dir).resolve()
+        output_path = Path(args.output).resolve() if str(args.output).strip() else None
+        result = compare_generation_run_dirs(
+            left_run_dir=left_run_dir,
+            right_run_dir=right_run_dir,
+            output_path=output_path,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
 
     if args.command == "serve":
         if args.stop:
@@ -2766,6 +3847,7 @@ def main() -> int:
                 "model_variant": args.model_variant,
                 "temperature": args.temperature,
                 "max_tokens": args.max_tokens,
+                "ollama_context_tokens": args.ollama_context_tokens,
                 "max_prompt_help_chars": args.max_prompt_help_chars,
                 "auth_enabled": bool(unique_tokens),
                 "generate_auth_required": bool(args.require_generate_auth),
@@ -2787,6 +3869,7 @@ def main() -> int:
                 model_variant=args.model_variant,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                ollama_context_tokens=args.ollama_context_tokens,
                 max_prompt_help_chars=args.max_prompt_help_chars,
                 auth_tokens=unique_tokens,
                 require_generate_auth=bool(args.require_generate_auth),
@@ -2817,6 +3900,7 @@ def main() -> int:
             command=_monitor_command(),
             inputs={
                 "tool_name": args.tool_name,
+                "tool_id": args.tool_id,
                 "server_url": args.server_url,
                 "provider": args.provider,
                 "model": args.model,
@@ -2826,6 +3910,8 @@ def main() -> int:
                 "temperature": args.temperature,
                 "max_tokens": args.max_tokens,
                 "max_prompt_help_chars": args.max_prompt_help_chars,
+                "include_toolsmith_citation": bool(args.include_toolsmith_citation),
+                "datatype_scaffold": bool(args.datatype_scaffold),
             },
             outputs={
                 "output_path": str(output_path),
@@ -2843,6 +3929,7 @@ def main() -> int:
                 auth_token=auth_token,
                 payload={
                     "tool_name": args.tool_name,
+                    "tool_id": args.tool_id,
                     "help_text": help_text,
                     "source_code": source_code,
                     "provider": args.provider,
@@ -2853,6 +3940,7 @@ def main() -> int:
                     "temperature": args.temperature,
                     "max_tokens": args.max_tokens,
                     "max_prompt_help_chars": args.max_prompt_help_chars,
+                    "include_toolsmith_citation": bool(args.include_toolsmith_citation),
                 },
             )
             artifact_text = str(
@@ -2887,12 +3975,19 @@ def main() -> int:
                 "report_path": str(report_path),
                 "validation": result.get("validation", {}),
             }
+            if args.datatype_scaffold:
+                payload["datatype_scaffold"] = write_datatype_scaffold(
+                    datatype_scaffold_dir_for_output(output_path),
+                    [payload],
+                    repository_style=False,
+                )
             tracker.complete(
                 outputs={
                     "output_path": str(output_path),
                     "output_xml_path": payload["output_xml_path"],
                     "output_udt_yaml_path": payload["output_udt_yaml_path"],
                     "report_path": str(report_path),
+                    "datatype_scaffold": payload.get("datatype_scaffold", {}),
                 },
                 summary={
                     "provider": payload["provider"],
@@ -2901,6 +3996,102 @@ def main() -> int:
                 },
             )
             print(json.dumps(payload, indent=2))
+            return 0
+        except Exception as error:
+            tracker.fail(error)
+            raise
+
+    if args.command == "generate-suite-remote":
+        output_dir = Path(args.output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        help_text = Path(args.help_text_file).resolve().read_text(encoding="utf-8")
+        source_code = (
+            Path(args.source_file).resolve().read_text(encoding="utf-8")
+            if args.source_file
+            else ""
+        )
+        auth_token = os.getenv(args.auth_token_env)
+        metadata = _shed_metadata_from_args(
+            args,
+            default_name=f"suite_{safe_repository_name(args.tool_name)}",
+            default_description=f"Generated Galaxy Toolsmith suite for {args.tool_name}",
+            suite=True,
+            repositories=[],
+        )
+        tracker = create_monitor_run_tracker(
+            paths,
+            kind="inference",
+            command=_monitor_command(),
+            inputs={
+                "tool_name": args.tool_name,
+                "server_url": args.server_url,
+                "provider": args.provider,
+                "model": args.model,
+                "model_variant": args.model_variant,
+                "skills_profile": args.skills_profile,
+                "temperature": args.temperature,
+                "max_tokens": args.max_tokens,
+                "max_prompt_help_chars": args.max_prompt_help_chars,
+                "max_suite_tools": args.max_suite_tools,
+                "generate_sidecars": args.generate_sidecars,
+                "repair_invalid_xml": args.repair_invalid_xml,
+                "include_toolsmith_citation": bool(args.include_toolsmith_citation),
+                "datatype_scaffold": bool(args.datatype_scaffold),
+            },
+            outputs={"output_dir": str(output_dir)},
+        )
+        try:
+            result = request_remote_json(
+                server_url=args.server_url,
+                endpoint="/generate-suite",
+                method="POST",
+                auth_token=auth_token,
+                payload={
+                    "tool_name": args.tool_name,
+                    "help_text": help_text,
+                    "source_code": source_code,
+                    "provider": args.provider,
+                    "model": args.model,
+                    "model_variant": args.model_variant,
+                    "skills_profile": args.skills_profile,
+                    "temperature": args.temperature,
+                    "max_tokens": args.max_tokens,
+                    "max_prompt_help_chars": args.max_prompt_help_chars,
+                    "max_suite_tools": args.max_suite_tools,
+                    "generate_sidecars": args.generate_sidecars,
+                    "repair_invalid_xml": args.repair_invalid_xml,
+                    "include_toolsmith_citation": bool(args.include_toolsmith_citation),
+                    "datatype_scaffold": bool(args.datatype_scaffold),
+                    "shed_metadata": metadata.to_dict(),
+                    "no_shed_yml": args.no_shed_yml,
+                },
+                timeout=900.0,
+            )
+            written: list[dict] = []
+            for artifact in result.get("artifacts", []):
+                if not isinstance(artifact, dict):
+                    continue
+                relative_path = str(artifact.get("relative_path") or "").strip()
+                if not relative_path or relative_path.startswith("../") or "/../" in relative_path:
+                    continue
+                target = output_dir / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(str(artifact.get("content") or ""), encoding="utf-8")
+                written.append({"relative_path": relative_path, "path": str(target)})
+            manifest_path = output_dir / ".gtsm" / "remote-suite-result.json"
+            write_gtsm_json(manifest_path, {**result, "local_written": written})
+            tracker.complete(
+                outputs={
+                    "output_dir": str(output_dir),
+                    "written": written,
+                    "manifest_path": str(manifest_path),
+                },
+                summary={
+                    "suite_plan": result.get("suite_plan", {}),
+                    "generated_file_count": len(result.get("generated_files", [])),
+                },
+            )
+            print(json.dumps({"output_dir": str(output_dir), "written": written}, indent=2))
             return 0
         except Exception as error:
             tracker.fail(error)
@@ -3022,6 +4213,7 @@ def main() -> int:
                 artifact_format=artifact_format,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                ollama_context_tokens=args.ollama_context_tokens,
                 max_workers=args.max_workers,
                 limit=args.limit,
                 xsd_path=xsd_path,
@@ -3039,6 +4231,8 @@ def main() -> int:
                 resume_existing=args.resume_existing,
                 checkpoint_records_path=checkpoint_records_path,
                 source_context_settings=source_context,
+                suite_generation=args.suite_generation,
+                max_suite_tools=args.max_suite_tools,
             )
             benchmark_summary_path.parent.mkdir(parents=True, exist_ok=True)
             benchmark_summary_path.write_text(summary.to_json(), encoding="utf-8")
@@ -3057,6 +4251,7 @@ def main() -> int:
                 "artifact_format": format_cli_value(artifact_format),
                 "temperature": args.temperature,
                 "max_tokens": args.max_tokens,
+                "ollama_context_tokens": args.ollama_context_tokens,
                 "max_workers": args.max_workers,
                 "num_processes": args.num_processes,
                 "gpu_devices": args.gpu_devices,
@@ -3070,6 +4265,8 @@ def main() -> int:
                 "record_timeout_seconds": args.record_timeout_seconds,
                 "max_prompt_help_chars": args.max_prompt_help_chars,
                 "source_context": source_context.to_dict(),
+                "suite_generation": args.suite_generation,
+                "max_suite_tools": args.max_suite_tools,
                 "repair_invalid_xml": args.repair_invalid_xml,
                 "allow_compact_fallback": args.allow_compact_fallback,
                 "limit": args.limit,
@@ -3164,6 +4361,7 @@ def main() -> int:
                 artifact_format=artifact_format,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                ollama_context_tokens=args.ollama_context_tokens,
                 max_workers=args.max_workers,
                 limit=args.limit,
                 xsd_path=xsd_path,
@@ -3186,6 +4384,8 @@ def main() -> int:
                 checkpoint_records_path=checkpoint_records_path,
                 record_timeout_seconds=args.record_timeout_seconds,
                 source_context_settings=source_context,
+                suite_generation=args.suite_generation,
+                max_suite_tools=args.max_suite_tools,
             )
             benchmark_summary_path.parent.mkdir(parents=True, exist_ok=True)
             benchmark_summary_path.write_text(summary.to_json(), encoding="utf-8")

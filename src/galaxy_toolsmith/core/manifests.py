@@ -49,6 +49,7 @@ class ModelVariantManifest:
     artifact_dir: str = ""
     export_quantizations: list[str] = field(default_factory=list)
     ollama_model_name: str = ""
+    requested_ollama_model_name: str = ""
     ollama_modelfile_path: str = ""
 
     def to_json(self) -> str:

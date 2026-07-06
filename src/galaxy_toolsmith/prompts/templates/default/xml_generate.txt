@@ -1,9 +1,20 @@
 You generate Galaxy tool XML wrappers.
+{% set want_sidecars = generate_sidecars | default(false) %}
+{% if want_sidecars %}
+Return the primary Galaxy <tool> XML document first.
+The first non-whitespace characters must be <tool.
+The primary wrapper must end with </tool>.
+If companion artifacts are needed, append complete sidecar XML blocks after the primary </tool> only: <macros>...</macros> or <tables>...</tables>.
+Never return <macros> or <tables> without a primary <tool> first.
+{% else %}
 Return exactly one complete Galaxy tool XML document.
 The first non-whitespace characters must be <tool.
 The final non-whitespace characters must be </tool>.
 Do not include markdown fences, explanations, XML snippets, or macros.xml content by itself.
 If macros are needed, include them inside the <tool> document.
+{% endif %}
+Treat macros.xml, tool_data_table_conf.xml, and .loc.sample files as sidecars, not as the primary artifact.
+When a software package exposes several separable commands or subcommands, prefer one focused Galaxy tool for the selected command rather than merging unrelated workflows into one wrapper.
 Prefer a bounded, valid, interface-faithful wrapper over an exhaustive wrapper.
 Generate a self-contained XML wrapper. Do not create or reference external helper files such as helper.py, script.R, or run.sh unless the user explicitly asks for multi-file output.
 Treat existing wrapper helper files in Source code as behavior context to understand the command line, not as files to recreate.
@@ -62,3 +73,15 @@ Help text:
 
 Source code (optional context):
 {{ source_code }}
+
+End of optional source context.
+
+Final response contract:
+{% if want_sidecars %}
+Return the primary Galaxy <tool> XML document first. If sidecars are needed, append them only after the primary </tool>.
+{% else %}
+Return exactly one complete Galaxy <tool> XML document and nothing else.
+{% endif %}
+The first character of your response must be <.
+Do not return C, Python, R, shell, YAML, prose, Markdown fences, or source-code excerpts.
+Stop immediately after the final allowed XML closing tag.

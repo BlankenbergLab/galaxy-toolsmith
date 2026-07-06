@@ -10,21 +10,42 @@ from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.providers.base import (
     GenerationInput,
     GenerationOutput,
-    extract_generated_artifact,
+    generation_output_from_response,
     generation_prompt_task,
 )
+
+
+def _positive_int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = int(text)
+    return parsed if parsed > 0 else None
 
 
 class OllamaProvider:
     name = "ollama"
 
-    def __init__(self, model: str, temperature: float, max_tokens: int):
+    def __init__(
+        self,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        context_tokens: int | None = None,
+    ):
         base = os.getenv("GTSM_OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
         self.base_url = base
         self.url = f"{base}/api/generate"
         self.model = model or os.getenv("GTSM_OLLAMA_MODEL", "llama3")
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.context_tokens = _positive_int_or_none(
+            context_tokens
+            if context_tokens is not None
+            else os.getenv("GTSM_OLLAMA_CONTEXT_TOKENS")
+        )
         self.timeout_seconds = int(os.getenv("GTSM_OLLAMA_TIMEOUT_SECONDS", "120"))
         self.auth_header = os.getenv("GTSM_OLLAMA_AUTH_HEADER", "").strip()
 
@@ -39,6 +60,7 @@ class OllamaProvider:
                 "skills_profile": request.skills_profile,
                 "repair_context": request.repair_context,
                 "interface_hints": request.interface_hints,
+                "generate_sidecars": request.generate_sidecars,
             },
         )
 
@@ -52,6 +74,8 @@ class OllamaProvider:
                 "num_predict": self.max_tokens,
             },
         }
+        if self.context_tokens is not None:
+            payload["options"]["num_ctx"] = self.context_tokens
         headers = with_user_agent_headers({"Content-Type": "application/json"})
         if self.auth_header:
             if ":" in self.auth_header:
@@ -78,10 +102,8 @@ class OllamaProvider:
         content = str(data.get("response", "")).strip()
         if not content:
             raise RuntimeError("Ollama returned empty response.")
-        artifact = extract_generated_artifact(content, request.artifact_format)
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
+        return generation_output_from_response(
+            response_text=content,
+            request=request,
             provider=self.name,
-            model_variant=request.model_variant,
         )

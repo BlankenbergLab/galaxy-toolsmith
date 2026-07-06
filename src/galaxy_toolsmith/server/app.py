@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import socket
+from datetime import UTC, datetime
 from pathlib import Path
 
 from galaxy_toolsmith import __version__
@@ -11,6 +12,8 @@ from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.artifacts import format_cli_value, normalize_artifact_format
 from galaxy_toolsmith.inference.generation import generate_xml_from_content
 from galaxy_toolsmith.inference.prompt_context import DEFAULT_MAX_PROMPT_HELP_CHARS
+from galaxy_toolsmith.inference.repository import build_tool_shed_metadata
+from galaxy_toolsmith.inference.suite import generate_suite_from_content, plan_suite_from_content
 from galaxy_toolsmith.orchestration.distributed import (
     claim_task,
     complete_task,
@@ -32,6 +35,10 @@ from galaxy_toolsmith.runtime.run_registry import (
 from galaxy_toolsmith.runtime.status import emit_status, resolve_status_log_path
 
 
+def datetime_now_compact() -> str:
+    return datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+
+
 def _variant_ids(paths: WorkspacePaths) -> list[str]:
     variants_dir = paths.models_root / "variants"
     if not variants_dir.exists():
@@ -48,6 +55,7 @@ def create_app(
     max_tokens: int,
     auth_tokens: list[str],
     require_generate_auth: bool,
+    ollama_context_tokens: int | None = None,
     allow_stub_local: bool = False,
     status_log_path: Path | None = None,
     max_prompt_help_chars: int = DEFAULT_MAX_PROMPT_HELP_CHARS,
@@ -84,6 +92,30 @@ def create_app(
             raise HTTPException(status_code=401, detail="unauthorized")
         if authorization.split(" ", 1)[1] not in token_set:
             raise HTTPException(status_code=401, detail="unauthorized")
+
+    def _bundle_artifacts(output_dir: Path) -> list[dict]:
+        artifacts: list[dict] = []
+        for path in sorted(output_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                relative_path = path.relative_to(output_dir).as_posix()
+            except ValueError:
+                continue
+            if relative_path.startswith(".gtsm/raw/"):
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            artifacts.append(
+                {
+                    "relative_path": relative_path,
+                    "content": content,
+                    "size_bytes": len(content.encode("utf-8", errors="replace")),
+                }
+            )
+        return artifacts
 
     @app.get("/")
     async def root() -> RedirectResponse:
@@ -502,6 +534,7 @@ def create_app(
         )
 
         tool_name = str(payload.get("tool_name", "")).strip()
+        tool_id = str(payload.get("tool_id", "")).strip()
         help_text = str(payload.get("help_text", ""))
         source_code = str(payload.get("source_code", ""))
         req_provider = str(payload.get("provider", provider))
@@ -511,10 +544,16 @@ def create_app(
         req_artifact_format = normalize_artifact_format(str(payload.get("artifact_format", "xml")))
         req_temperature = float(payload.get("temperature", temperature))
         req_max_tokens = int(payload.get("max_tokens", max_tokens))
+        req_ollama_context_tokens = (
+            int(payload["ollama_context_tokens"])
+            if payload.get("ollama_context_tokens") is not None
+            else ollama_context_tokens
+        )
         req_max_prompt_help_chars = int(
             payload.get("max_prompt_help_chars", max_prompt_help_chars)
         )
         req_allow_stub_local = bool(payload.get("allow_stub_local", allow_stub_local))
+        include_toolsmith_citation = bool(payload.get("include_toolsmith_citation", True))
 
         if not tool_name:
             raise HTTPException(status_code=400, detail="tool_name_required")
@@ -525,6 +564,7 @@ def create_app(
             command=["server", "/generate"],
             inputs={
                 "tool_name": tool_name,
+                "tool_id": tool_id,
                 "provider": req_provider,
                 "model": req_model,
                 "model_variant": req_model_variant,
@@ -532,7 +572,9 @@ def create_app(
                 "artifact_format": format_cli_value(req_artifact_format),
                 "temperature": req_temperature,
                 "max_tokens": req_max_tokens,
+                "ollama_context_tokens": req_ollama_context_tokens,
                 "max_prompt_help_chars": req_max_prompt_help_chars,
+                "include_toolsmith_citation": include_toolsmith_citation,
             },
         )
         try:
@@ -545,11 +587,15 @@ def create_app(
                 model=req_model,
                 temperature=req_temperature,
                 max_tokens=req_max_tokens,
+                ollama_context_tokens=req_ollama_context_tokens,
                 skills_profile=req_skills_profile,
                 paths=paths,
                 allow_stub_local=req_allow_stub_local,
                 max_prompt_help_chars=req_max_prompt_help_chars,
                 artifact_format=req_artifact_format,
+                tool_id=tool_id,
+                tool_display_name=tool_name,
+                include_toolsmith_citation=include_toolsmith_citation,
             )
             tracker.complete(
                 summary={
@@ -557,6 +603,141 @@ def create_app(
                     "model_variant": result.get("model_variant", req_model_variant),
                     "validation": result.get("validation", {}),
                 }
+            )
+            return result
+        except Exception as error:
+            tracker.fail(error)
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/suite/plan")
+    async def suite_plan(
+        payload: dict,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        _authorize(
+            authorization,
+            required=bool(token_set) and require_generate_auth,
+        )
+        tool_name = str(payload.get("tool_name", "")).strip()
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="tool_name_required")
+        plan = plan_suite_from_content(
+            tool_name=tool_name,
+            help_text=str(payload.get("help_text", "")),
+            source_code=str(payload.get("source_code", "")),
+            max_suite_tools=int(payload.get("max_suite_tools", 8)),
+            force_suite=bool(payload.get("force_suite", False)),
+        )
+        return plan.to_dict()
+
+    @app.post("/generate-suite")
+    async def generate_suite_endpoint(
+        payload: dict,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict:
+        _authorize(
+            authorization,
+            required=bool(token_set) and require_generate_auth,
+        )
+        tool_name = str(payload.get("tool_name", "")).strip()
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="tool_name_required")
+        req_provider = str(payload.get("provider", provider))
+        req_model = str(payload.get("model", model))
+        req_model_variant = str(payload.get("model_variant", model_variant))
+        req_skills_profile = str(payload.get("skills_profile", "default"))
+        req_temperature = float(payload.get("temperature", temperature))
+        req_max_tokens = int(payload.get("max_tokens", max_tokens))
+        req_ollama_context_tokens = (
+            int(payload["ollama_context_tokens"])
+            if payload.get("ollama_context_tokens") is not None
+            else ollama_context_tokens
+        )
+        req_max_prompt_help_chars = int(
+            payload.get("max_prompt_help_chars", max_prompt_help_chars)
+        )
+        req_allow_stub_local = bool(payload.get("allow_stub_local", allow_stub_local))
+        include_toolsmith_citation = bool(payload.get("include_toolsmith_citation", True))
+        datatype_scaffold = bool(payload.get("datatype_scaffold", True))
+        request_id = f"suite-{datetime_now_compact()}"
+        output_dir = paths.runs_root / "generation-suite" / request_id / "repository"
+        shed = payload.get("shed_metadata", {}) if isinstance(payload.get("shed_metadata"), dict) else {}
+        metadata = build_tool_shed_metadata(
+            name=str(shed.get("name") or payload.get("shed_name") or f"suite_{tool_name}"),
+            owner=str(shed.get("owner") or payload.get("shed_owner") or ""),
+            description=str(
+                shed.get("description")
+                or payload.get("shed_description")
+                or f"Generated Galaxy Toolsmith suite for {tool_name}"
+            ),
+            homepage_url=str(shed.get("homepage_url") or payload.get("shed_homepage_url") or ""),
+            remote_repository_url=str(
+                shed.get("remote_repository_url")
+                or payload.get("shed_remote_repository_url")
+                or ""
+            ),
+            categories=list(shed.get("categories") or payload.get("shed_categories") or []),
+            suite=True,
+            repositories=[],
+        )
+        tracker = create_monitor_run_tracker(
+            paths,
+            kind="inference",
+            command=["server", "/generate-suite"],
+            inputs={
+                "tool_name": tool_name,
+                "provider": req_provider,
+                "model": req_model,
+                "model_variant": req_model_variant,
+                "skills_profile": req_skills_profile,
+                "temperature": req_temperature,
+                "max_tokens": req_max_tokens,
+                "ollama_context_tokens": req_ollama_context_tokens,
+                "max_prompt_help_chars": req_max_prompt_help_chars,
+                "max_suite_tools": int(payload.get("max_suite_tools", 8)),
+                "include_toolsmith_citation": include_toolsmith_citation,
+                "datatype_scaffold": datatype_scaffold,
+            },
+            outputs={"output_dir": str(output_dir)},
+        )
+        try:
+            record = generate_suite_from_content(
+                paths=paths,
+                tool_name=tool_name,
+                help_text=str(payload.get("help_text", "")),
+                source_code=str(payload.get("source_code", "")),
+                output_dir=output_dir,
+                provider_name=req_provider,
+                model_variant=req_model_variant,
+                model=req_model,
+                temperature=req_temperature,
+                max_tokens=req_max_tokens,
+                ollama_context_tokens=req_ollama_context_tokens,
+                skills_profile=req_skills_profile,
+                allow_stub_local=req_allow_stub_local,
+                max_prompt_help_chars=req_max_prompt_help_chars,
+                max_suite_tools=int(payload.get("max_suite_tools", 8)),
+                generate_sidecars=bool(payload.get("generate_sidecars", True)),
+                raw_response_logs=bool(payload.get("raw_response_logs", False)),
+                stream_output=bool(payload.get("stream_output", False)),
+                repair_invalid_xml=bool(payload.get("repair_invalid_xml", True)),
+                shed_metadata=metadata,
+                write_shed=not bool(payload.get("no_shed_yml", False)),
+                include_toolsmith_citation=include_toolsmith_citation,
+                datatype_scaffold=datatype_scaffold,
+            )
+            result = record.to_dict()
+            result["artifacts"] = _bundle_artifacts(output_dir)
+            tracker.complete(
+                outputs={
+                    "output_dir": str(output_dir),
+                    "shed_yml_path": result.get("shed_yml_path", ""),
+                    "generated_files": result.get("generated_files", []),
+                },
+                summary={
+                    "suite_plan": result.get("suite_plan", {}),
+                    "generated_file_count": len(result.get("generated_files", [])),
+                },
             )
             return result
         except Exception as error:
@@ -796,6 +977,7 @@ def serve(
     allow_stub_local: bool = False,
     status_log_path: Path | None = None,
     max_prompt_help_chars: int = DEFAULT_MAX_PROMPT_HELP_CHARS,
+    ollama_context_tokens: int | None = None,
 ) -> None:
     try:
         import uvicorn
@@ -811,6 +993,7 @@ def serve(
         model_variant=model_variant,
         temperature=temperature,
         max_tokens=max_tokens,
+        ollama_context_tokens=ollama_context_tokens,
         max_prompt_help_chars=max_prompt_help_chars,
         auth_tokens=auth_tokens,
         require_generate_auth=require_generate_auth,
@@ -826,6 +1009,7 @@ def serve(
             "provider": provider,
             "model": model,
             "model_variant": model_variant,
+            "ollama_context_tokens": ollama_context_tokens,
             "max_prompt_help_chars": max_prompt_help_chars,
             "auth_enabled": bool(auth_tokens),
             "generate_auth_required": bool(auth_tokens) and require_generate_auth,
@@ -849,6 +1033,15 @@ def main() -> int:
     parser.add_argument("--model-variant", default="server-default")
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--ollama-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Ollama runtime context tokens (num_ctx). "
+            "Unset uses GTSM_OLLAMA_CONTEXT_TOKENS or Ollama defaults; 0 disables num_ctx."
+        ),
+    )
     parser.add_argument("--max-prompt-help-chars", type=int, default=DEFAULT_MAX_PROMPT_HELP_CHARS)
     parser.add_argument(
         "--auth-token",
@@ -895,6 +1088,7 @@ def main() -> int:
         model_variant=args.model_variant,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        ollama_context_tokens=args.ollama_context_tokens,
         max_prompt_help_chars=args.max_prompt_help_chars,
         auth_tokens=tokens,
         require_generate_auth=args.require_generate_auth,

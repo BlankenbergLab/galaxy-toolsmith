@@ -117,6 +117,40 @@ def test_local_provider_stub_can_generate_udt_yaml(tmp_path: Path) -> None:
     assert "shell_command:" in output.artifact_text
 
 
+def test_local_provider_command_preserves_raw_response_and_sidecars(tmp_path: Path) -> None:
+    script = tmp_path / "emit_wrapper.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "sys.stdout.write(",
+                "    \"<tool id='echo_tool' name='Echo' version='0.1.0'><command>echo hi</command></tool>\"",
+                "    \"\\n<tables><table name='indexes' comment_char='#'><columns>value</columns></table></tables>\"",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    raw_log = tmp_path / "raw.log"
+    provider = local_mod.LocalProvider(command=f"{sys.executable} {script}")
+
+    output = provider.generate_wrapper(
+        GenerationInput(
+            tool_name="echo_tool",
+            help_text="Usage: echo_tool",
+            source_code="",
+            model_variant="variant-a",
+            raw_response_log_path=str(raw_log),
+            generate_sidecars=True,
+        )
+    )
+
+    assert output.provider == "local"
+    assert output.raw_response_text == raw_log.read_text(encoding="utf-8")
+    assert output.artifact_text.startswith("<tool")
+    assert output.sidecar_artifacts[0]["role"] == "tool_data_table_conf"
+
+
 def test_local_provider_uses_peft_variant_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -504,6 +538,30 @@ def test_local_peft_provider_extracts_first_complete_tool_xml(
     )
 
 
+def test_local_peft_provider_reports_sidecars_from_raw_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = local_mod.LocalPeftProvider(base_model="base-model", adapter_path="/tmp/adapter")
+    monkeypatch.setattr(provider, "_lazy_load", lambda: (object(), object()))
+    monkeypatch.setattr(
+        local_mod,
+        "_decode_model_response",
+        lambda **kwargs: (
+            "<tool id='echo_tool' name='Echo Tool' version='0.1.0'>\n"
+            "  <command>echo test</command>\n"
+            "</tool>\n"
+            "<tables><table name='refs'><columns>value, label, path</columns></table></tables>"
+        ),
+    )
+
+    output = provider.generate_wrapper(_request("variant-a"))
+
+    assert output.xml_wrapper.startswith("<tool")
+    assert output.raw_response_text.startswith("<tool")
+    assert output.sidecar_artifacts[0]["role"] == "tool_data_table_conf"
+    assert output.sidecar_artifacts[0]["root_tag"] == "tables"
+
+
 def test_decode_model_response_handles_tensor_chat_template_output() -> None:
     input_ids = _FakeTensor([1, 2])
     model = _FakeModel()
@@ -525,6 +583,30 @@ def test_decode_model_response_handles_tensor_chat_template_output() -> None:
     assert "temperature" not in model.generate_kwargs
     assert model.generate_kwargs["pad_token_id"] == 99
     assert tokenizer.decoded_tokens == [12, 13, 14]
+
+
+def test_decode_model_response_writes_raw_response_log(tmp_path: Path) -> None:
+    input_ids = _FakeTensor([1, 2])
+    model = _FakeModel()
+    tokenizer = _FakeTokenizer(input_ids)
+    raw_log = tmp_path / "raw.log"
+
+    response = local_mod._decode_model_response(
+        model=model,
+        tokenizer=tokenizer,
+        request=GenerationInput(
+            tool_name="echo_tool",
+            help_text="Usage: echo_tool",
+            source_code="",
+            model_variant="variant-a",
+            raw_response_log_path=str(raw_log),
+        ),
+        max_new_tokens=7,
+        temperature=0.0,
+    )
+
+    assert response == "decoded-output"
+    assert raw_log.read_text(encoding="utf-8") == "decoded-output"
 
 
 def test_decode_model_response_adds_tool_close_stopping_criteria(

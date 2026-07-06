@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from galaxy_toolsmith.cli.main import _build_parser
+from galaxy_toolsmith.cli.main import _build_parser, _suite_generation_help_text_from_args
+from galaxy_toolsmith.inference.runtime_discovery import RuntimeDiscoveryResult
 
 
 def test_serve_detach_flags_parse() -> None:
@@ -51,6 +52,8 @@ def test_train_backend_flags_parse() -> None:
             "--dry-run-backend",
             "--max-seq-length",
             "4096",
+            "--max-steps",
+            "5",
             "--no-pad-to-sequence-len",
             "--attn-implementation",
             "xformers",
@@ -86,6 +89,7 @@ def test_train_backend_flags_parse() -> None:
     assert args.distributed_strategy == "fsdp"
     assert args.dry_run_backend is True
     assert args.max_seq_length == 4096
+    assert args.max_steps == 5
     assert args.pad_to_sequence_len is False
     assert args.attn_implementation == "xformers"
     assert args.source_context_mode == "snippets"
@@ -101,6 +105,184 @@ def test_train_backend_flags_parse() -> None:
     assert args.status_interval_seconds == 15
     assert args.stream_logs is True
     assert args.log_tail_lines == 7
+
+
+def test_generate_wrapper_source_archive_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-wrapper",
+            "--tool-name",
+            "my_tool",
+            "--tool-id",
+            "my_tool_safe_id",
+            "--help-text-file",
+            "help.txt",
+            "--source-archive",
+            "https://example.org/my_tool.tar.gz",
+            "--source-archive-max-bytes",
+            "1GiB",
+            "--source-archive-timeout-seconds",
+            "17",
+            "--source-context-mode",
+            "all-filtered",
+            "--output",
+            "my_tool.xml",
+        ]
+    )
+
+    assert args.command == "generate-wrapper"
+    assert args.tool_id == "my_tool_safe_id"
+    assert args.source_archive == "https://example.org/my_tool.tar.gz"
+    assert args.source_archive_max_bytes == 1024**3
+    assert args.source_archive_timeout_seconds == 17
+    assert args.source_context_mode == "all-filtered"
+
+
+def test_generate_wrapper_logging_repair_and_sidecar_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-wrapper",
+            "--tool-name",
+            "my_tool",
+            "--help-text-file",
+            "help.txt",
+            "--tool-granularity",
+            "subcommands",
+            "--stream-output",
+            "--raw-response-log",
+            "/tmp/raw.log",
+            "--no-repair-invalid-xml",
+            "--generate-sidecars",
+            "--sidecar-output-dir",
+            "/tmp/sidecars",
+            "--output",
+            "my_tool.xml",
+        ]
+    )
+
+    assert args.tool_granularity == "subcommands"
+    assert args.stream_output is True
+    assert args.raw_response_log == "/tmp/raw.log"
+    assert args.repair_invalid_xml is False
+    assert args.generate_sidecars is True
+    assert args.sidecar_output_dir == "/tmp/sidecars"
+    assert args.include_toolsmith_citation is True
+    assert args.datatype_scaffold is True
+
+
+def test_generate_wrapper_postprocess_opt_out_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-wrapper",
+            "--tool-name",
+            "my tool",
+            "--help-text-file",
+            "help.txt",
+            "--no-toolsmith-citation",
+            "--no-datatype-scaffold",
+            "--output",
+            "my_tool.xml",
+        ]
+    )
+
+    assert args.include_toolsmith_citation is False
+    assert args.datatype_scaffold is False
+
+
+def test_generate_wrapper_runtime_discovery_flags_parse_without_help_file() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-wrapper",
+            "--tool-name",
+            "minibwa",
+            "--discovery-mode",
+            "conda",
+            "--discovery-package",
+            "minibwa=0.2.0",
+            "--discovery-command",
+            "minibwa",
+            "--discovery-source-download-max-bytes",
+            "1GiB",
+            "--source-context-mode",
+            "snippets",
+            "--output",
+            "minibwa.xml",
+        ]
+    )
+
+    assert args.help_text_file == ""
+    assert args.discovery_mode == "conda"
+    assert args.discovery_package == ["minibwa=0.2.0"]
+    assert args.discovery_command == "minibwa"
+    assert args.discovery_source_download_max_bytes == 1024**3
+    assert args.discover_subcommands is True
+
+
+def test_generate_wrapper_source_archive_conflicts_with_source_root() -> None:
+    parser = _build_parser()
+    try:
+        parser.parse_args(
+            [
+                "generate-wrapper",
+                "--tool-name",
+                "my_tool",
+                "--help-text-file",
+                "help.txt",
+                "--source-root",
+                "/tmp/source",
+                "--source-archive",
+                "source.tar.gz",
+                "--output",
+                "my_tool.xml",
+            ]
+        )
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("--source-root and --source-archive should conflict")
+
+
+def test_estimate_training_tokens_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "estimate-training-tokens",
+            "--profile",
+            "agentic-devstral-24b",
+            "--artifact-format",
+            "mixed",
+            "--max-seq-lengths",
+            "12k,16k",
+            "--source-context-mode",
+            "all-filtered",
+            "--compare-source-context-modes",
+            "all-filtered,all-raw",
+            "--source-context-budget-ladder",
+            "--limit",
+            "10",
+            "--exact-tokenizer",
+            "--workers",
+            "4",
+            "--longest-sample-count",
+            "7",
+        ]
+    )
+
+    assert args.command == "estimate-training-tokens"
+    assert args.profile == "agentic-devstral-24b"
+    assert args.artifact_format == "mixed"
+    assert args.max_seq_lengths == "12k,16k"
+    assert args.source_context_mode == "all-filtered"
+    assert args.compare_source_context_modes == "all-filtered,all-raw"
+    assert args.source_context_budget_ladder is True
+    assert args.limit == 10
+    assert args.exact_tokenizer is True
+    assert args.workers == 4
+    assert args.longest_sample_count == 7
 
 
 def test_train_mlx_backend_aliases_parse() -> None:
@@ -184,6 +366,8 @@ def test_benchmark_startup_flags_parse() -> None:
             "/tmp/checkpoint.jsonl",
             "--record-timeout-seconds",
             "42",
+            "--ollama-context-tokens",
+            "16384",
             "--source-context-mode",
             "metadata",
             "--source-context-max-chars",
@@ -205,6 +389,7 @@ def test_benchmark_startup_flags_parse() -> None:
     assert args.resume_existing is True
     assert args.checkpoint_records == "/tmp/checkpoint.jsonl"
     assert args.record_timeout_seconds == 42
+    assert args.ollama_context_tokens == 16384
     assert args.source_context_mode == "metadata"
     assert args.source_context_max_chars == 3000
     assert args.source_context_max_files == 4
@@ -230,6 +415,8 @@ def test_generate_wrapper_source_context_flags_parse() -> None:
             "7000",
             "--source-context-max-files",
             "8",
+            "--ollama-context-tokens",
+            "12288",
             "--output",
             "/tmp/tool.xml",
         ]
@@ -240,6 +427,160 @@ def test_generate_wrapper_source_context_flags_parse() -> None:
     assert args.source_context_mode == "all-filtered"
     assert args.source_context_max_chars == 7000
     assert args.source_context_max_files == 8
+    assert args.ollama_context_tokens == 12288
+
+
+def test_generate_wrapper_repository_output_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-wrapper",
+            "--tool-name",
+            "tool",
+            "--help-text-file",
+            "/tmp/help.txt",
+            "--repository-output-dir",
+            "/tmp/repo",
+            "--shed-owner",
+            "iuc",
+            "--shed-category",
+            "Sequence Analysis",
+        ]
+    )
+
+    assert args.repository_output_dir == "/tmp/repo"
+    assert args.output == ""
+    assert args.shed_owner == "iuc"
+    assert args.shed_category == ["Sequence Analysis"]
+
+
+def test_generate_suite_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-suite",
+            "--tool-name",
+            "samtools",
+            "--help-text-file",
+            "/tmp/help.txt",
+            "--output-dir",
+            "/tmp/repo",
+            "--max-suite-tools",
+            "3",
+            "--ollama-context-tokens",
+            "32768",
+            "--local-offload-policy",
+            "fail",
+            "--local-gpu-memory-reserve-gib",
+            "3.5",
+            "--raw-response-logs",
+            "--shed-owner",
+            "iuc",
+        ]
+    )
+
+    assert args.command == "generate-suite"
+    assert args.max_suite_tools == 3
+    assert args.ollama_context_tokens == 32768
+    assert args.local_offload_policy == "fail"
+    assert args.local_gpu_memory_reserve_gib == 3.5
+    assert args.raw_response_logs is True
+    assert args.shed_owner == "iuc"
+
+
+def test_compare_generation_runs_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "compare-generation-runs",
+            "--left-run-dir",
+            "/tmp/q4",
+            "--right-run-dir",
+            "/tmp/full",
+            "--output",
+            "/tmp/comparison.json",
+        ]
+    )
+
+    assert args.command == "compare-generation-runs"
+    assert args.left_run_dir == "/tmp/q4"
+    assert args.right_run_dir == "/tmp/full"
+    assert args.output == "/tmp/comparison.json"
+
+
+def test_generate_suite_runtime_discovery_flags_parse_without_help_file() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-suite",
+            "--tool-name",
+            "samtools",
+            "--discovery-mode",
+            "auto",
+            "--discovery-package",
+            "samtools",
+            "--discovery-container-runtime",
+            "singularity",
+            "--no-discover-subcommands",
+            "--output-dir",
+            "/tmp/repo",
+        ]
+    )
+
+    assert args.command == "generate-suite"
+    assert args.help_text_file == ""
+    assert args.discovery_mode == "auto"
+    assert args.discovery_package == ["samtools"]
+    assert args.discovery_container_runtime == "singularity"
+    assert args.discover_subcommands is False
+
+
+def test_generate_suite_runtime_discovery_uses_compact_top_level_help() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-suite",
+            "--tool-name",
+            "minibwa",
+            "--discovery-mode",
+            "conda",
+            "--output-dir",
+            "/tmp/repo",
+        ]
+    )
+    discovery = RuntimeDiscoveryResult(
+        mode="conda",
+        selected_runtime="conda",
+        top_level_help="$ minibwa --help\nUsage: minibwa {index,map}",
+        subcommand_help={"minibwa map": "$ minibwa map --help\nLOTS OF MAP HELP"},
+        combined_help_text=(
+            "Runtime-discovered top-level command help:\n\n"
+            "$ minibwa --help\nUsage: minibwa {index,map}\n\n"
+            "Runtime-discovered subcommand help for `minibwa map`:\n\n"
+            "$ minibwa map --help\nLOTS OF MAP HELP"
+        ),
+    )
+
+    help_text = _suite_generation_help_text_from_args(args, discovery)
+
+    assert "Usage: minibwa {index,map}" in help_text
+    assert "LOTS OF MAP HELP" not in help_text
+
+
+def test_benchmark_suite_generation_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "benchmark-generate",
+            "--suite-generation",
+            "generate",
+            "--max-suite-tools",
+            "5",
+        ]
+    )
+
+    assert args.suite_generation == "generate"
+    assert args.max_suite_tools == 5
 
 
 def test_extract_corpus_container_flags_parse() -> None:

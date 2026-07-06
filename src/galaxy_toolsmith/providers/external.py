@@ -10,7 +10,7 @@ from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.providers.base import (
     GenerationInput,
     GenerationOutput,
-    extract_generated_artifact,
+    generation_output_from_response,
     generation_prompt_task,
 )
 
@@ -26,6 +26,7 @@ def _prompt(request: GenerationInput) -> str:
             "skills_profile": request.skills_profile,
             "repair_context": request.repair_context,
             "interface_hints": request.interface_hints,
+            "generate_sidecars": request.generate_sidecars,
         },
     )
 
@@ -72,12 +73,10 @@ class OpenAIProvider:
         }
         response = _post_json(self.url, headers, payload)
         content = response["choices"][0]["message"]["content"]
-        artifact = extract_generated_artifact(content, request.artifact_format)
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
+        return generation_output_from_response(
+            response_text=content,
+            request=request,
             provider=self.name,
-            model_variant=request.model_variant,
         )
 
 
@@ -109,12 +108,10 @@ class AnthropicProvider:
         blocks = response.get("content", [])
         text_chunks = [item.get("text", "") for item in blocks if item.get("type") == "text"]
         content = "\n".join(text_chunks).strip()
-        artifact = extract_generated_artifact(content, request.artifact_format)
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
+        return generation_output_from_response(
+            response_text=content,
+            request=request,
             provider=self.name,
-            model_variant=request.model_variant,
         )
 
 
@@ -146,10 +143,8 @@ class CopilotProvider:
         }
         response = _post_json(self.url, headers, payload)
         content = response["choices"][0]["message"]["content"]
-        artifact = extract_generated_artifact(content, request.artifact_format)
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
+        return generation_output_from_response(
+            response_text=content,
+            request=request,
             provider=self.name,
-            model_variant=request.model_variant,
         )

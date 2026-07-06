@@ -126,6 +126,7 @@ class ToolRecord:
     command_text: str = ""
     wrapper_helper_files: list[dict] = field(default_factory=list)
     wrapper_configfiles: list[dict] = field(default_factory=list)
+    wrapper_sidecar_files: list[dict] = field(default_factory=list)
     wrapper_source_summary: dict = field(default_factory=dict)
 
     # datatype / tests
@@ -1052,11 +1053,17 @@ def _extract_wrapper_configfiles(
 def _wrapper_source_summary(
     helper_files: list[dict],
     configfiles: list[dict],
+    sidecar_files: list[dict],
     skipped: dict[str, int],
 ) -> dict:
     return {
         "helper_file_count": len(helper_files),
         "configfile_count": len(configfiles),
+        "sidecar_file_count": len(sidecar_files),
+        "macro_sidecar_count": sum(1 for item in sidecar_files if item.get("role") == "macros"),
+        "tool_data_sidecar_count": sum(
+            1 for item in sidecar_files if str(item.get("role", "")).startswith("tool_data")
+        ),
         "truncated_configfile_count": sum(
             1 for item in configfiles if item.get("content_truncated")
         ),
@@ -1083,6 +1090,87 @@ def _wrapper_source_summary(
         "skipped_file_count": sum(skipped.values()),
         "skip_reasons": dict(sorted(skipped.items())),
     }
+
+
+def _xml_file_root_tag(path: Path) -> str:
+    try:
+        return str(ET.parse(path).getroot().tag)
+    except (ET.ParseError, OSError):
+        return ""
+
+
+def _sidecar_role(path: Path, root_tag: str = "") -> str:
+    name = path.name.lower()
+    rel = path.as_posix().lower()
+    if root_tag == "macros" or "macro" in name:
+        return "macros"
+    if root_tag == "tables" or name.startswith("tool_data_table_conf"):
+        return "tool_data_table_conf"
+    if name.endswith(".loc.sample") or rel.endswith(".loc.sample"):
+        return "tool_data_loc_sample"
+    return ""
+
+
+def _sidecar_candidate_paths(tool_dir: Path, macro_files_rel: list[str]) -> list[Path]:
+    candidates: list[Path] = [tool_dir / rel for rel in macro_files_rel]
+    candidates.extend(sorted(tool_dir.glob("tool_data_table_conf*.xml")))
+    candidates.extend(sorted(tool_dir.glob("*.loc.sample")))
+    candidates.extend(sorted((tool_dir / "tool-data").glob("*.loc.sample")))
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(path)
+    return deduped
+
+
+def _extract_wrapper_sidecar_files(
+    tool_dir: Path,
+    *,
+    primary_xml: Path,
+    macro_files_rel: list[str],
+    max_bytes: int,
+) -> list[dict]:
+    sidecars: list[dict] = []
+    for path in _sidecar_candidate_paths(tool_dir, macro_files_rel):
+        if not path.exists() or not path.is_file() or path.resolve() == primary_xml.resolve():
+            continue
+        if not _is_within_directory(path, tool_dir):
+            continue
+        try:
+            raw_bytes = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw_bytes[:8192]:
+            continue
+        text = raw_bytes.decode("utf-8", errors="replace")
+        root_tag = _xml_file_root_tag(path) if path.suffix.lower() == ".xml" else ""
+        role = _sidecar_role(path.relative_to(tool_dir), root_tag=root_tag)
+        if not role:
+            continue
+        content, byte_count, stored_byte_count, sha256, content_truncated = (
+            _bounded_configfile_content(text, max_bytes=max_bytes)
+        )
+        sidecars.append(
+            {
+                "path": str(path),
+                "relative_path": path.relative_to(tool_dir).as_posix(),
+                "role": role,
+                "root_tag": root_tag,
+                "byte_count": byte_count,
+                "stored_byte_count": stored_byte_count,
+                "sha256": sha256,
+                "content_truncated": content_truncated,
+                "content": content,
+            }
+        )
+    return sidecars
 
 
 def _configfile_display_name(configfile: dict) -> str:
@@ -8417,6 +8505,15 @@ def _user_defined_tool_yaml_files(tool_dir: Path) -> list[str]:
     return matches
 
 
+def _primary_tool_xml_files(tool_dir: Path) -> list[str]:
+    matches: list[str] = []
+    for path in sorted(tool_dir.glob("*.xml")):
+        if _xml_file_root_tag(path) != "tool":
+            continue
+        matches.append(path.relative_to(tool_dir).as_posix())
+    return matches
+
+
 def _extract_one_wrapper(
     tools_root: Path,
     tool_dir: Path,
@@ -8432,6 +8529,7 @@ def _extract_one_wrapper(
     source_semaphore: threading.Semaphore | None = None,
 ) -> ToolRecord:
     xml_rel = str(xml_file.relative_to(tool_dir))
+    primary_xml_files = _primary_tool_xml_files(tool_dir)
     shed = _load_shed_metadata(tool_dir)
     package_name = str(shed.get("name", "") or "").strip() or tool_dir.name
     package_owner = str(shed.get("owner", "") or "").strip()
@@ -8504,9 +8602,16 @@ def _extract_one_wrapper(
         command_text,
         max_bytes=settings.wrapper_configfile_max_bytes,
     )
+    wrapper_sidecar_files = _extract_wrapper_sidecar_files(
+        tool_dir,
+        primary_xml=xml_file,
+        macro_files_rel=macro_files_rel,
+        max_bytes=settings.wrapper_configfile_max_bytes,
+    )
     wrapper_source_summary = _wrapper_source_summary(
         wrapper_helper_files,
         wrapper_configfiles,
+        wrapper_sidecar_files,
         wrapper_helper_skipped,
     )
     configfile_help_context = _wrapper_configfile_help_context(wrapper_configfiles)
@@ -8616,7 +8721,7 @@ def _extract_one_wrapper(
         tool_id=tool_id,
         tool_dir=str(tool_dir),
         wrapper_path=str(xml_file),
-        xml_files=[xml_rel],
+        xml_files=primary_xml_files or [xml_rel],
         udt_yaml_path=udt_yaml_path,
         udt_yaml_files=udt_yaml_files,
         shed_name=package_name,
@@ -8643,6 +8748,7 @@ def _extract_one_wrapper(
         command_text=command_text,
         wrapper_helper_files=wrapper_helper_files,
         wrapper_configfiles=wrapper_configfiles,
+        wrapper_sidecar_files=wrapper_sidecar_files,
         wrapper_source_summary=wrapper_source_summary,
         input_parameter_types=p_types,
         input_datatypes=in_types,
@@ -10775,6 +10881,8 @@ def extract_tools_corpus(
         for xml_file in sorted(tool_dir.glob("*.xml")):
             lowered_name = xml_file.name.lower()
             if "macro" in lowered_name:
+                continue
+            if _xml_file_root_tag(xml_file) != "tool":
                 continue
             wrappers.append((tool_dir, xml_file))
 

@@ -3,13 +3,15 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from xml.etree import ElementTree as ET
 
 _OPTION_TAG_RE = re.compile(r"<option\b", re.IGNORECASE)
 _OPTION_VALUE_RE = re.compile(r"<option\b[^>]*\bvalue=(['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
 _OPTION_TEXT_RE = re.compile(r"<option\b[^>]*>(.*?)</option>", re.IGNORECASE | re.DOTALL)
 _TAG_END_RE = re.compile(r"<[^>]*\Z")
 _TAG_RE = re.compile(r"<[^>]+>")
-_OUTPUT_VARIABLE_RE = re.compile(r"(?:#set\s+)?\$?out_[A-Za-z0-9_]+")
+_OUTPUT_VARIABLE_RE = re.compile(r"(?:#set\s+)?\$?(out_[A-Za-z0-9_]+)")
+_TEST_TAG_RE = re.compile(r"<test\b", re.IGNORECASE)
 
 MAX_OPTION_COUNT = 60
 MAX_OPTION_VALUE_CHARS = 96
@@ -18,6 +20,7 @@ REPEATED_PREFIX_MIN_COUNT = 5
 REPEATED_PREFIX_CHARS = 24
 REPEATED_XML_LINE_MIN_COUNT = 12
 REPEATED_CHEETAH_FRAGMENT_MIN_COUNT = 8
+MAX_GENERATED_TEST_COUNT = 1
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,9 @@ class GeneratedXmlDiagnostics:
     repeated_xml_lines: list[str] = field(default_factory=list)
     repeated_xml_line_count: int = 0
     repeated_cheetah_fragments: int = 0
+    repeated_cheetah_fragment_details: list[dict[str, object]] = field(default_factory=list)
+    test_count: int = 0
+    too_many_tests: bool = False
     missing_closing_tool: bool = False
     ends_mid_tag: bool = False
     unclosed_cdata: bool = False
@@ -88,9 +94,17 @@ def diagnose_generated_xml(xml_wrapper: str) -> GeneratedXmlDiagnostics:
         )
 
     repeated_cheetah_fragments = _repeated_cheetah_fragment_count(value)
+    repeated_cheetah_fragment_details = _repeated_cheetah_fragment_details(value)
     if repeated_cheetah_fragments >= REPEATED_CHEETAH_FRAGMENT_MIN_COUNT:
         problems.append(
             f"Generated XML contains {repeated_cheetah_fragments} repeated Cheetah output-variable fragments."
+        )
+
+    test_count = _direct_test_count(value)
+    too_many_tests = test_count > MAX_GENERATED_TEST_COUNT
+    if too_many_tests:
+        problems.append(
+            f"Generated XML contains {test_count} direct <test> elements; generated wrappers should include one compact test."
         )
 
     return GeneratedXmlDiagnostics(
@@ -103,6 +117,9 @@ def diagnose_generated_xml(xml_wrapper: str) -> GeneratedXmlDiagnostics:
         repeated_xml_lines=repeated_xml_lines,
         repeated_xml_line_count=repeated_xml_line_count,
         repeated_cheetah_fragments=repeated_cheetah_fragments,
+        repeated_cheetah_fragment_details=repeated_cheetah_fragment_details,
+        test_count=test_count,
+        too_many_tests=too_many_tests,
         missing_closing_tool=missing_closing_tool,
         ends_mid_tag=ends_mid_tag,
         unclosed_cdata=unclosed_cdata,
@@ -140,5 +157,30 @@ def _repeated_xml_lines(xml_wrapper: str) -> list[str]:
     )
 
 
+def _repeated_cheetah_fragment_details(xml_wrapper: str) -> list[dict[str, object]]:
+    fragments = [_normalize_output_variable(match.group(1)) for match in _OUTPUT_VARIABLE_RE.finditer(xml_wrapper)]
+    counts = Counter(fragments)
+    return [
+        {"fragment": fragment, "count": count}
+        for fragment, count in sorted(counts.items())
+        if count >= REPEATED_CHEETAH_FRAGMENT_MIN_COUNT
+    ]
+
+
 def _repeated_cheetah_fragment_count(xml_wrapper: str) -> int:
-    return sum(1 for _ in _OUTPUT_VARIABLE_RE.finditer(xml_wrapper))
+    return sum(int(item["count"]) for item in _repeated_cheetah_fragment_details(xml_wrapper))
+
+
+def _normalize_output_variable(value: str) -> str:
+    return re.sub(r"_\d+\Z", "", value.strip())
+
+
+def _direct_test_count(xml_wrapper: str) -> int:
+    try:
+        root = ET.fromstring(xml_wrapper)
+    except ET.ParseError:
+        return len(_TEST_TAG_RE.findall(xml_wrapper))
+    tests = root.find("tests")
+    if tests is None:
+        return 0
+    return sum(1 for child in list(tests) if child.tag == "test")

@@ -14,7 +14,8 @@ Use the CLI (`gtsm`) for workspace setup, corpus extraction, training, evaluatio
 
 1. Start with [Quick Start](quickstart.md).
 2. Review [CLI Reference](cli-reference.md).
-3. See [Architecture and Decisions](architecture.md) for design rationale.
+3. Use [Context Ladder Training](context-ladder-training.md) for unattended long-context GPU runs.
+4. See [Architecture and Decisions](architecture.md) for design rationale.
 
 ## Acknowledgements
 

@@ -76,3 +76,22 @@ def test_diagnose_generated_xml_detects_repeated_cheetah_output_fragments() -> N
 
     assert diagnostics.has_problems is True
     assert diagnostics.repeated_cheetah_fragments == 9
+    assert diagnostics.repeated_cheetah_fragment_details == [
+        {"fragment": "out_protocol", "count": 9}
+    ]
+
+
+def test_diagnose_generated_xml_detects_too_many_generated_tests() -> None:
+    tests = "\n".join("<test><param name='input' value='reads.fq'/></test>" for _ in range(3))
+    xml = f"""<tool id="map" name="Map" version="0.1.0">
+    <command>minibwa map $input &gt; $out</command>
+    <inputs><param name="input" type="data" format="fastq"/></inputs>
+    <outputs><data name="out" format="bam"/></outputs>
+    <tests>{tests}</tests>
+</tool>"""
+
+    diagnostics = diagnose_generated_xml(xml)
+
+    assert diagnostics.has_problems is True
+    assert diagnostics.test_count == 3
+    assert diagnostics.too_many_tests is True

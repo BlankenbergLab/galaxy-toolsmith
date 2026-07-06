@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
-from concurrent.futures import ThreadPoolExecutor
 
 from galaxy_toolsmith.http_client import with_user_agent_headers
 

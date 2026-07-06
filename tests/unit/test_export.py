@@ -11,8 +11,10 @@ from galaxy_toolsmith.core.manifests import ModelVariantManifest
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.orchestration import export as export_mod
 from galaxy_toolsmith.orchestration.export import (
+    OLLAMA_MODEL_NAME_MAX_LENGTH,
     ExportResult,
     export_model_artifacts,
+    normalize_ollama_model_name,
     update_variant_ollama_metadata,
     write_ollama_modelfile,
 )
@@ -375,9 +377,144 @@ def test_write_ollama_modelfile_uses_exported_gguf(tmp_path: Path) -> None:
     content = modelfile.read_text(encoding="utf-8")
     assert "FROM " in content
     assert str(gguf_file) in content
+    assert 'PARAMETER stop "</tool>"' not in content
+    assert "{{ .Prompt }}" in content
+    assert "[INST]" not in content
 
 
-def test_write_ollama_modelfile_preserves_non_ascii_metadata(tmp_path: Path) -> None:
+def test_write_ollama_modelfile_uses_mistral_template_for_devstral_variant(tmp_path: Path) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    variant_id = "variant-a"
+    export_root = paths.models_root / "exports" / variant_id
+    gguf_file = export_root / "gguf" / "q4_k_m" / "variant-a.gguf"
+    gguf_file.parent.mkdir(parents=True, exist_ok=True)
+    gguf_file.write_text("dummy-gguf", encoding="utf-8")
+    (paths.models_root / "variants").mkdir(parents=True, exist_ok=True)
+    (paths.models_root / "variants" / f"{variant_id}.manifest.json").write_text(
+        json.dumps({"variant_id": variant_id, "base_model": "mistralai/Devstral-Small-2505"}),
+        encoding="utf-8",
+    )
+    export_result_path = export_root / "export.result.json"
+    export_result_path.write_text(
+        json.dumps(
+            {
+                "variant_id": variant_id,
+                "format": "gguf",
+                "quantizations": ["q4_k_m"],
+                "merged_path": "",
+                "gguf_path": str(gguf_file),
+                "gguf_paths": {"q4_k_m": str(gguf_file)},
+                "status": "completed",
+                "notes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    modelfile = write_ollama_modelfile(
+        paths=paths,
+        variant_id=variant_id,
+        model_name="galaxy-toolsmith-test",
+        from_quantization="q4_k_m",
+    )
+
+    content = modelfile.read_text(encoding="utf-8")
+    assert "[INST] {{ .Prompt }} [/INST]" in content
+    assert 'PARAMETER stop "</tool>"' not in content
+    updated = json.loads(export_result_path.read_text(encoding="utf-8"))
+    assert updated["ollama_template_style"] == "mistral"
+
+
+def test_write_ollama_modelfile_can_force_raw_template(monkeypatch, tmp_path: Path) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    variant_id = "variant-a"
+    export_root = paths.models_root / "exports" / variant_id
+    gguf_file = export_root / "gguf" / "q4_k_m" / "variant-a.gguf"
+    gguf_file.parent.mkdir(parents=True, exist_ok=True)
+    gguf_file.write_text("dummy-gguf", encoding="utf-8")
+    (paths.models_root / "variants").mkdir(parents=True, exist_ok=True)
+    (paths.models_root / "variants" / f"{variant_id}.manifest.json").write_text(
+        json.dumps({"variant_id": variant_id, "base_model": "mistralai/Devstral-Small-2505"}),
+        encoding="utf-8",
+    )
+    export_result_path = export_root / "export.result.json"
+    export_result_path.write_text(
+        json.dumps(
+            {
+                "variant_id": variant_id,
+                "format": "gguf",
+                "quantizations": ["q4_k_m"],
+                "merged_path": "",
+                "gguf_path": str(gguf_file),
+                "gguf_paths": {"q4_k_m": str(gguf_file)},
+                "status": "completed",
+                "notes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GTSM_OLLAMA_TEMPLATE_STYLE", "raw")
+
+    modelfile = write_ollama_modelfile(
+        paths=paths,
+        variant_id=variant_id,
+        model_name="galaxy-toolsmith-test",
+        from_quantization="q4_k_m",
+    )
+
+    content = modelfile.read_text(encoding="utf-8")
+    assert "{{ .Prompt }}" in content
+    assert "[INST]" not in content
+    updated = json.loads(export_result_path.read_text(encoding="utf-8"))
+    assert updated["ollama_template_style"] == "raw"
+
+
+def test_normalize_ollama_model_name_short_valid_name_is_unchanged() -> None:
+    normalized = normalize_ollama_model_name("gtsm-test:latest")
+
+    assert normalized.requested == "gtsm-test:latest"
+    assert normalized.effective == "gtsm-test:latest"
+    assert normalized.changed is False
+
+
+def test_normalize_ollama_model_name_shortens_current_failure_name() -> None:
+    requested = (
+        "gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-"
+        "devstral-fresh12k-allraw-20260706-q4"
+    )
+
+    normalized = normalize_ollama_model_name(requested)
+
+    assert normalized.requested == requested
+    assert normalized.changed is True
+    assert len(requested) == 89
+    assert len(normalized.effective) <= OLLAMA_MODEL_NAME_MAX_LENGTH
+    assert normalized.effective.startswith("gtsm-tools-iuc-devstral")
+    assert normalized.effective == normalize_ollama_model_name(requested).effective
+
+
+def test_normalize_ollama_model_name_hashes_similar_long_names_distinctly() -> None:
+    prefix = "gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-"
+
+    first = normalize_ollama_model_name(prefix + "one").effective
+    second = normalize_ollama_model_name(prefix + "two").effective
+
+    assert first != second
+    assert len(first) <= OLLAMA_MODEL_NAME_MAX_LENGTH
+    assert len(second) <= OLLAMA_MODEL_NAME_MAX_LENGTH
+
+
+def test_normalize_ollama_model_name_empty_uses_fallback() -> None:
+    normalized = normalize_ollama_model_name("   ")
+
+    assert normalized.effective.startswith("gtsm-model-")
+    assert normalized.changed is True
+    assert len(normalized.effective) <= OLLAMA_MODEL_NAME_MAX_LENGTH
+
+
+def test_write_ollama_modelfile_records_effective_and_requested_metadata(tmp_path: Path) -> None:
     paths = WorkspacePaths.from_repo_root(tmp_path)
     paths.create_directories()
     variant_id = "väriant-a"
@@ -406,9 +543,10 @@ def test_write_ollama_modelfile_preserves_non_ascii_metadata(tmp_path: Path) -> 
     )
 
     assert f"FROM {gguf_file}" in modelfile.read_text(encoding="utf-8")
-    updated_json = export_result_path.read_text(encoding="utf-8")
-    assert "gtsm-mödèle" in updated_json
-    assert "\\u" not in updated_json
+    updated = json.loads(export_result_path.read_text(encoding="utf-8"))
+    assert updated["ollama_model_name"] == "gtsm-m-d-le"
+    assert updated["requested_ollama_model_name"] == "gtsm-mödèle"
+    assert "\\u" not in export_result_path.read_text(encoding="utf-8")
 
 
 def test_write_ollama_modelfile_rejects_whitespace_gguf_paths(tmp_path: Path) -> None:
@@ -478,12 +616,14 @@ def test_update_variant_ollama_metadata_preserves_non_ascii(tmp_path: Path) -> N
     variant_path = update_variant_ollama_metadata(
         paths=paths,
         variant_id=variant_id,
-        ollama_model_name="gtsm-mödèle",
+        ollama_model_name="gtsm-m-d-le",
+        requested_ollama_model_name="gtsm-mödèle",
         ollama_modelfile_path="/tmp/Mödelfile",
         export_quantizations=["q4_k_m"],
     )
 
     text = variant_path.read_text(encoding="utf-8")
+    assert "gtsm-m-d-le" in text
     assert "gtsm-mödèle" in text
     assert "/tmp/Mödelfile" in text
     assert "\\u" not in text
@@ -526,9 +666,11 @@ def test_llama_cpp_subprocesses_decode_utf8(monkeypatch, tmp_path: Path) -> None
 
 
 def test_create_ollama_model_decodes_utf8(monkeypatch, tmp_path: Path) -> None:
+    observed_command = []
     observed_kwargs = {}
 
     def fake_run(command, **kwargs):
+        observed_command.extend(command)
         observed_kwargs.update(kwargs)
         return subprocess.CompletedProcess(command, 0, stdout="créé\n", stderr="")
 
@@ -537,6 +679,9 @@ def test_create_ollama_model_decodes_utf8(monkeypatch, tmp_path: Path) -> None:
     payload = export_mod.create_ollama_model(tmp_path / "Modelfile", "gtsm-mödèle")
 
     assert payload["stdout"] == "créé"
+    assert payload["model_name"] == "gtsm-m-d-le"
+    assert payload["requested_ollama_model_name"] == "gtsm-mödèle"
+    assert observed_command[2] == "gtsm-m-d-le"
     assert observed_kwargs["encoding"] == "utf-8"
     assert observed_kwargs["errors"] == "replace"
 
@@ -554,3 +699,24 @@ def test_create_ollama_model_uses_configured_cli(monkeypatch, tmp_path: Path) ->
     export_mod.create_ollama_model(tmp_path / "Modelfile", "gtsm-test")
 
     assert observed_command[:2] == ["/opt/ollama/bin/ollama", "create"]
+
+
+def test_create_ollama_model_uses_shortened_effective_name(monkeypatch, tmp_path: Path) -> None:
+    requested = (
+        "gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-"
+        "devstral-fresh12k-allraw-20260706-q4"
+    )
+    observed_command = []
+
+    def fake_run(command, **kwargs):
+        observed_command.extend(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(export_mod.subprocess, "run", fake_run)
+
+    payload = export_mod.create_ollama_model(tmp_path / "Modelfile", requested)
+
+    assert payload["requested_ollama_model_name"] == requested
+    assert len(payload["model_name"]) <= OLLAMA_MODEL_NAME_MAX_LENGTH
+    assert observed_command[2] == payload["model_name"]
+    assert observed_command[2] != requested

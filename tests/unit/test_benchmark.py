@@ -93,6 +93,76 @@ def test_benchmark_generation_supports_udt_yaml(tmp_path: Path) -> None:
     assert summary.quality["validity"]["udt_schema_valid_rate"] == 1.0
 
 
+def test_benchmark_generation_can_record_suite_recommendation(tmp_path: Path) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps({"tool_name": "samtools", "help_text": "Usage: samtools {view,sort}\n"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = run_benchmark_generation(
+        paths=paths,
+        corpus_jsonl=corpus_jsonl,
+        wrappers_dir=tmp_path / "wrappers",
+        generation_records_path=tmp_path / "generation_records.json",
+        evaluation_report_path=tmp_path / "evaluation_report.json",
+        provider="local",
+        model_variant="",
+        model="",
+        temperature=0.0,
+        max_tokens=128,
+        max_workers=1,
+        limit=None,
+        xsd_path=None,
+        run_planemo=False,
+        allow_stub_local=True,
+        suite_generation="recommend",
+    )
+
+    records = json.loads((tmp_path / "generation_records.json").read_text(encoding="utf-8"))
+    assert summary.suite_generation == "recommend"
+    assert summary.suite_count == 1
+    assert records[0]["suite_plan"]["suite_recommended"] is True
+
+
+def test_benchmark_generation_can_generate_suite_bundle(tmp_path: Path) -> None:
+    paths = WorkspacePaths.from_repo_root(tmp_path)
+    paths.create_directories()
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps({"tool_name": "samtools", "help_text": "Usage: samtools {view,sort}\n"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = run_benchmark_generation(
+        paths=paths,
+        corpus_jsonl=corpus_jsonl,
+        wrappers_dir=tmp_path / "wrappers",
+        generation_records_path=tmp_path / "generation_records.json",
+        evaluation_report_path=tmp_path / "evaluation_report.json",
+        provider="local",
+        model_variant="",
+        model="",
+        temperature=0.0,
+        max_tokens=128,
+        max_workers=1,
+        limit=None,
+        xsd_path=None,
+        run_planemo=False,
+        allow_stub_local=True,
+        suite_generation="generate",
+    )
+
+    records = json.loads((tmp_path / "generation_records.json").read_text(encoding="utf-8"))
+    generated_files = records[0]["generated_files"]
+    assert summary.suite_generation == "generate"
+    assert summary.suite_member_count == 2
+    assert len(generated_files) == 2
+    assert all(Path(item["path"]).exists() for item in generated_files)
+
+
 def test_benchmark_generation_records_source_context_summary(tmp_path: Path) -> None:
     paths = WorkspacePaths.from_repo_root(tmp_path)
     paths.create_directories()

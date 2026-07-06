@@ -37,6 +37,7 @@ from galaxy_toolsmith.inference.source_context import (
     SourceContextSettings,
     build_source_context_from_record,
 )
+from galaxy_toolsmith.inference.suite import generate_suite_from_content, plan_suite_from_content
 from galaxy_toolsmith.inference.validation import PlanemoTestOptions
 from galaxy_toolsmith.runtime.progress import make_progress_snapshot
 from galaxy_toolsmith.runtime.status import emit_status
@@ -46,6 +47,7 @@ TRUNCATION_REPAIR_MAX_PROMPT_HELP_CHARS = 1500
 DEFAULT_BENCHMARK_MIN_ITEMS_PER_PROCESS = 1
 LOCAL_GPU_TOPOLOGIES = {"per-process", "model-parallel"}
 LOCAL_OFFLOAD_POLICIES = {"allow", "fail"}
+SUITE_GENERATION_MODES = {"single", "recommend", "generate"}
 
 
 def utc_now_iso() -> str:
@@ -73,6 +75,9 @@ class BenchmarkSummary:
     startup: dict = field(default_factory=dict)
     failures: list[dict] = field(default_factory=list)
     quality: dict = field(default_factory=dict)
+    suite_generation: str = "single"
+    suite_count: int = 0
+    suite_member_count: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -914,8 +919,14 @@ def run_benchmark_generation(
     planemo_test_options: PlanemoTestOptions | None = None,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    suite_generation: str = "single",
+    max_suite_tools: int = 8,
+    ollama_context_tokens: int | None = None,
 ) -> BenchmarkSummary:
     artifact_format = normalize_artifact_format(artifact_format)
+    suite_generation = str(suite_generation or "single").strip().lower()
+    if suite_generation not in SUITE_GENERATION_MODES:
+        raise ValueError(f"Unsupported suite_generation: {suite_generation}")
     source_context_settings = (source_context_settings or SourceContextSettings()).normalized()
     if local_gpu_topology not in LOCAL_GPU_TOPOLOGIES:
         raise ValueError(f"Unsupported local GPU topology: {local_gpu_topology}")
@@ -942,11 +953,19 @@ def run_benchmark_generation(
         int(record.get("corpus_index")): record for record in checkpointed_records
     }
     generation_records: list[dict] = list(checkpointed_records)
-    generated_wrappers.extend(
-        path
-        for record in checkpointed_records
-        if (path := output_path_from_record(record, artifact_format)) is not None
-    )
+    for record in checkpointed_records:
+        suite_paths = [
+            Path(str(item.get("path")))
+            for item in record.get("generated_files", [])
+            if isinstance(item, dict)
+            and item.get("role") == "tool_xml"
+            and str(item.get("path", "")).strip()
+        ]
+        if suite_paths:
+            generated_wrappers.extend(path for path in suite_paths if path.exists())
+            continue
+        if (path := output_path_from_record(record, artifact_format)) is not None:
+            generated_wrappers.append(path)
     if not resume_existing and checkpoint_records_path.exists():
         checkpoint_records_path.unlink()
     records_to_run = [
@@ -965,6 +984,7 @@ def run_benchmark_generation(
         "local_gpu_topology": local_gpu_topology,
         "local_offload_policy": local_offload_policy,
         "local_gpu_memory_reserve_gib": local_gpu_memory_reserve_gib,
+        "ollama_context_tokens": ollama_context_tokens,
         "resume_existing": resume_existing,
         "checkpoint_records_path": str(checkpoint_records_path),
         "checkpoint_records_loaded": len(checkpointed_records),
@@ -985,6 +1005,7 @@ def run_benchmark_generation(
             allow_stub_local=allow_stub_local,
             local_offload_policy=local_offload_policy,
             local_gpu_memory_reserve_gib=local_gpu_memory_reserve_gib,
+            ollama_context_tokens=ollama_context_tokens,
         )
         model_load_started_at = utc_now_iso()
         model_load_started_perf = time.perf_counter()
@@ -1050,6 +1071,7 @@ def run_benchmark_generation(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            ollama_context_tokens=ollama_context_tokens,
             allow_stub_local=allow_stub_local,
             provider_instance=provider_instance,
             max_prompt_help_chars=max_prompt_help_chars
@@ -1065,12 +1087,21 @@ def run_benchmark_generation(
         )
         return json.loads(generation.to_json())
 
-    def _one(record: dict) -> tuple[dict | None, dict | None, Path | None]:
+    def _one(record: dict) -> tuple[dict | None, dict | None, list[Path]]:
         tool_name = record.get("tool_name", "unknown_tool")
         help_text = record.get("help_text", "")
         output_artifact = wrappers_dir / _safe_wrapper_filename(str(tool_name), artifact_format)
         source_context = build_source_context_from_record(record, source_context_settings)
         source_context_summary = source_context.to_dict()
+        suite_plan = None
+        if suite_generation in {"recommend", "generate"} and artifact_format == ARTIFACT_FORMAT_XML:
+            suite_plan = plan_suite_from_content(
+                tool_name=str(tool_name),
+                help_text=str(help_text),
+                source_code=source_context.text,
+                max_suite_tools=max_suite_tools,
+                force_suite=suite_generation == "generate",
+            )
         record_started_at = utc_now_iso()
         output_keys = {
             "output_path": str(output_artifact),
@@ -1095,6 +1126,42 @@ def run_benchmark_generation(
             },
         )
         try:
+            if suite_generation == "generate" and artifact_format == ARTIFACT_FORMAT_XML:
+                suite_output_dir = wrappers_dir / Path(_safe_wrapper_filename(str(tool_name))).stem
+                suite = generate_suite_from_content(
+                    paths=paths,
+                    tool_name=str(tool_name),
+                    help_text=str(help_text),
+                    source_code=source_context.text,
+                    output_dir=suite_output_dir,
+                    provider_name=provider,
+                    model_variant=model_variant,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    provider_instance=provider_instance,
+                    skills_profile="default",
+                    allow_stub_local=allow_stub_local,
+                    max_prompt_help_chars=max_prompt_help_chars,
+                    local_offload_policy=local_offload_policy,
+                    local_gpu_memory_reserve_gib=local_gpu_memory_reserve_gib,
+                    ollama_context_tokens=ollama_context_tokens,
+                    source_context_summary=source_context_summary,
+                    max_suite_tools=max_suite_tools,
+                    force_suite=True,
+                    generate_sidecars=True,
+                    repair_invalid_xml=repair_invalid_xml,
+                )
+                generated = _annotate_generation_record(suite.to_dict(), record)
+                wrapper_paths = [
+                    Path(str(item.get("path")))
+                    for item in generated.get("generated_files", [])
+                    if isinstance(item, dict)
+                    and item.get("role") == "tool_xml"
+                    and str(item.get("path", "")).strip()
+                ]
+                return generated, None, wrapper_paths
+
             generated = _generate_one(
                 tool_name=str(tool_name),
                 help_text=str(help_text),
@@ -1105,9 +1172,11 @@ def run_benchmark_generation(
                 source_context_summary=source_context_summary,
             )
             generated = _annotate_generation_record(generated, record)
+            if suite_plan is not None:
+                generated["suite_plan"] = suite_plan.to_dict()
             validation = generated.get("validation")
             if _artifact_validation_passed(validation, artifact_format):
-                return generated, None, output_artifact
+                return generated, None, [output_artifact]
 
             initial_failure = _artifact_validation_failure(
                 generated=generated,
@@ -1140,8 +1209,10 @@ def run_benchmark_generation(
                     source_context_summary=source_context_summary,
                 )
                 repaired = _annotate_generation_record(repaired, record)
+                if suite_plan is not None:
+                    repaired["suite_plan"] = suite_plan.to_dict()
                 if _artifact_validation_passed(repaired.get("validation"), artifact_format):
-                    return repaired, None, output_artifact
+                    return repaired, None, [output_artifact]
                 repaired_failure = _xml_validation_failure(
                     generated=repaired,
                     tool_name=str(tool_name),
@@ -1170,8 +1241,10 @@ def run_benchmark_generation(
                         repaired_failure=repaired_failure,
                     )
                     fallback = _annotate_generation_record(fallback, record)
+                    if suite_plan is not None:
+                        fallback["suite_plan"] = suite_plan.to_dict()
                     if _xml_validation_passed(fallback.get("validation")):
-                        return fallback, None, output_artifact
+                        return fallback, None, [output_artifact]
                     repaired_failure["compact_fallback_attempted"] = True
                     repaired_failure["compact_fallback_validation"] = fallback.get("validation", {})
                 elif _failure_suggests_truncation(repaired_failure):
@@ -1180,9 +1253,9 @@ def run_benchmark_generation(
                         "Compact fallback is disabled; malformed/truncated generations "
                         "are reported as benchmark failures."
                     )
-                return None, repaired_failure, None
+                return None, repaired_failure, []
 
-            return None, initial_failure, None
+            return None, initial_failure, []
         except Exception as error:
             return (
                 None,
@@ -1195,7 +1268,7 @@ def run_benchmark_generation(
                     artifact_format=artifact_format,
                 )
                 | _record_metadata(record),
-                None,
+                [],
             )
 
     if records_to_run:
@@ -1218,14 +1291,13 @@ def run_benchmark_generation(
         total_units = len(records)
         completed_base = len(checkpointed_records)
         for completed_delta, future in enumerate(as_completed(futures), start=1):
-            generated, failed, wrapper_path = future.result()
+            generated, failed, wrapper_paths = future.result()
             if generated is not None:
                 generation_records.append(generated)
                 _append_checkpoint_record(checkpoint_records_path, generated, checkpoint_lock)
             if failed is not None:
                 failures.append(failed)
-            if wrapper_path is not None:
-                generated_wrappers.append(wrapper_path)
+            generated_wrappers.extend(wrapper_paths)
             completed_units = completed_base + completed_delta
             snapshot = make_progress_snapshot(
                 started_at=started_at,
@@ -1260,6 +1332,19 @@ def run_benchmark_generation(
         completed_units=len(records),
         total_units=len(records),
     ).to_dict()
+    suite_count = sum(
+        1
+        for record in generation_records
+        if isinstance(record.get("suite_plan"), dict)
+        and record["suite_plan"].get("suite_recommended") is True
+    )
+    suite_member_count = sum(
+        len(record.get("generated_files", []))
+        if isinstance(record.get("generated_files"), list)
+        else len(record.get("suite_plan", {}).get("tools", []))
+        for record in generation_records
+        if isinstance(record.get("suite_plan"), dict)
+    )
 
     summary = BenchmarkSummary(
         created_at=utc_now_iso(),
@@ -1285,6 +1370,9 @@ def run_benchmark_generation(
             startup=startup,
             artifact_format=artifact_format,
         ),
+        suite_generation=suite_generation,
+        suite_count=suite_count,
+        suite_member_count=suite_member_count,
     )
     return summary
 
@@ -1382,6 +1470,7 @@ def _build_shard_command(
     temperature: float,
     max_tokens: int,
     max_workers: int,
+    ollama_context_tokens: int | None,
     xsd_path: Path | None,
     run_planemo: bool,
     allow_stub_local: bool,
@@ -1395,6 +1484,8 @@ def _build_shard_command(
     checkpoint_records_path: Path,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    suite_generation: str = "single",
+    max_suite_tools: int = 8,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1438,7 +1529,13 @@ def _build_shard_command(
         str(checkpoint_records_path),
         "--status-log",
         str(shard.status_log_path),
+        "--suite-generation",
+        suite_generation,
+        "--max-suite-tools",
+        str(max_suite_tools),
     ]
+    if ollama_context_tokens is not None:
+        command.extend(["--ollama-context-tokens", str(ollama_context_tokens)])
     if model:
         command.extend(["--model", model])
     if xsd_path is not None:
@@ -1661,6 +1758,9 @@ def run_benchmark_generation_sharded(
     planemo_test_options: PlanemoTestOptions | None = None,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    suite_generation: str = "single",
+    max_suite_tools: int = 8,
+    ollama_context_tokens: int | None = None,
 ) -> BenchmarkSummary:
     artifact_format = normalize_artifact_format(artifact_format)
     source_context_settings = (source_context_settings or SourceContextSettings()).normalized()
@@ -1716,6 +1816,9 @@ def run_benchmark_generation_sharded(
                 run_planemo_tests=run_planemo_tests,
                 planemo_test_options=planemo_test_options,
                 source_context_settings=source_context_settings,
+                suite_generation=suite_generation,
+                max_suite_tools=max_suite_tools,
+                ollama_context_tokens=ollama_context_tokens,
             )
         finally:
             if devices:
@@ -1774,6 +1877,7 @@ def run_benchmark_generation_sharded(
             "record_timeout_seconds": record_timeout_seconds,
             "run_planemo_tests": run_planemo_tests,
             "source_context": source_context_settings.to_dict(),
+            "ollama_context_tokens": ollama_context_tokens,
         },
     )
 
@@ -1808,6 +1912,9 @@ def run_benchmark_generation_sharded(
                 checkpoint_records_path=shard.checkpoint_records_path,
                 artifact_format=artifact_format,
                 source_context_settings=source_context_settings,
+                suite_generation=suite_generation,
+                max_suite_tools=max_suite_tools,
+                ollama_context_tokens=ollama_context_tokens,
             )
             futures.append(
                 executor.submit(
@@ -1850,11 +1957,20 @@ def run_benchmark_generation_sharded(
     _atomic_write_text(generation_records_path, json.dumps(generation_records, indent=2))
     _write_checkpoint_records(checkpoint_records_path, generation_records)
 
-    generated_wrappers = [
-        output_path
-        for record in generation_records
-        if (output_path := output_path_from_record(record, artifact_format)) is not None
-    ]
+    generated_wrappers: list[Path] = []
+    for record in generation_records:
+        suite_paths = [
+            Path(str(item.get("path")))
+            for item in record.get("generated_files", [])
+            if isinstance(item, dict)
+            and item.get("role") == "tool_xml"
+            and str(item.get("path", "")).strip()
+        ]
+        if suite_paths:
+            generated_wrappers.extend(path for path in suite_paths if path.exists())
+            continue
+        if (output_path := output_path_from_record(record, artifact_format)) is not None:
+            generated_wrappers.append(output_path)
     evaluation_summary = evaluate_wrapper_paths(
         wrapper_paths=generated_wrappers,
         output_report=evaluation_report_path,
@@ -1892,6 +2008,19 @@ def run_benchmark_generation_sharded(
         "model_load_seconds_max": round(max(model_load_seconds), 4) if model_load_seconds else 0.0,
         "model_load_seconds_mean": _mean(model_load_seconds),
     }
+    suite_count = sum(
+        1
+        for record in generation_records
+        if isinstance(record.get("suite_plan"), dict)
+        and record["suite_plan"].get("suite_recommended") is True
+    )
+    suite_member_count = sum(
+        len(record.get("generated_files", []))
+        if isinstance(record.get("generated_files"), list)
+        else len(record.get("suite_plan", {}).get("tools", []))
+        for record in generation_records
+        if isinstance(record.get("suite_plan"), dict)
+    )
     summary = BenchmarkSummary(
         created_at=utc_now_iso(),
         corpus_path=str(corpus_jsonl),
@@ -1916,6 +2045,9 @@ def run_benchmark_generation_sharded(
             startup=startup,
             artifact_format=artifact_format,
         ),
+        suite_generation=suite_generation,
+        suite_count=suite_count,
+        suite_member_count=suite_member_count,
     )
     benchmark_summary_path.parent.mkdir(parents=True, exist_ok=True)
     benchmark_summary_path.write_text(summary.to_json(), encoding="utf-8")

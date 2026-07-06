@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 import galaxy_toolsmith.orchestration.training as training_mod
+import galaxy_toolsmith.orchestration.training_estimates as training_estimates_mod
 from galaxy_toolsmith.core.manifests import TrainingRunManifest
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.source_context import source_context_settings
@@ -37,6 +38,11 @@ from galaxy_toolsmith.orchestration.training import (
     get_local_training_run,
     list_local_training_runs,
     run_training,
+)
+from galaxy_toolsmith.orchestration.training_estimates import (
+    DEFAULT_SOURCE_BUDGET_LADDER,
+    estimate_training_tokens,
+    parse_context_lengths,
 )
 from galaxy_toolsmith.runtime.capabilities import RuntimeCapabilities
 from galaxy_toolsmith.runtime.mlx_lm_lora import _merge_tokenizer_config
@@ -161,6 +167,15 @@ def test_record_training_help_text_includes_container_usage_once() -> None:
             "help_text": "Wrapper help",
             "container_help_text": "Usage: tool --input FILE",
             "container_usage_text": "$ tool\nUsage: tool <command>",
+            "container_execution": [
+                {
+                    "status": "container-command-help",
+                    "command": "tool view --help",
+                    "probe_role": "subcommand",
+                    "stdout": "Usage: tool view --input FILE",
+                    "stderr": "",
+                }
+            ],
         }
     )
 
@@ -169,6 +184,9 @@ def test_record_training_help_text_includes_container_usage_once() -> None:
     assert "Usage: tool --input FILE" in help_text
     assert "Command-line usage collected from container execution" in help_text
     assert "$ tool" in help_text
+    assert "Structured runtime help probe commands" in help_text
+    assert "Command: tool view --help" in help_text
+    assert "Probe role: subcommand" in help_text
 
     deduped = _record_training_help_text(
         {
@@ -396,6 +414,69 @@ def test_load_instruction_records_falls_back_to_wrapper_when_expanded_missing(
     assert diagnostics["missing_xml_target_count"] == 0
 
 
+def test_load_instruction_records_rejects_non_tool_xml_primary_targets(
+    tmp_path: Path,
+) -> None:
+    table_path = tmp_path / "tool_data_table_conf.xml"
+    table_path.write_text(
+        "<tables><table name='ref'><columns>value, label, path</columns></table></tables>",
+        encoding="utf-8",
+    )
+    wrapper_path = tmp_path / "wrapper.xml"
+    wrapper_path.write_text(
+        '<tool id="real_tool" name="Real"><command>real</command></tool>',
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "real_tool",
+                "expanded_xml_path": str(table_path),
+                "wrapper_path": str(wrapper_path),
+                "help_text": "real help",
+                "shed_name": "real_tool",
+                "shed_owner": "iuc",
+                "shed_description": "Real tool repository",
+                "shed_categories": ["Sequence Analysis"],
+                "is_suite_root": True,
+                "suite_members": ["real_tool", "real_tool_extra"],
+                "wrapper_sidecar_files": [
+                    {
+                        "relative_path": "tool_data_table_conf.xml",
+                        "role": "tool_data_table_conf",
+                        "root_tag": "tables",
+                        "byte_count": 80,
+                        "content": table_path.read_text(encoding="utf-8"),
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records, diagnostics = _load_instruction_records_with_diagnostics(
+        corpus_jsonl,
+        _training_profile(),
+        repo_root=tmp_path,
+    )
+
+    assert len(records) == 1
+    assert records[0]["output"].startswith('<tool id="real_tool"')
+    assert records[0]["output"].lstrip().startswith("<tables") is False
+    assert "Tool Shed repository metadata" in records[0]["instruction"]
+    assert "name: real_tool" in records[0]["instruction"]
+    assert "Companion Galaxy sidecar artifacts:" in records[0]["instruction"]
+    assert "tool_data_table_conf.xml" in records[0]["instruction"]
+    assert "Related suite tools:" in records[0]["instruction"]
+    assert diagnostics["skipped_non_tool_xml_target_count"] == 1
+    assert diagnostics["records_with_shed_metadata"] == 1
+    assert diagnostics["records_with_suite_metadata"] == 1
+    assert diagnostics["records_with_repository_sidecars"] == 1
+    assert diagnostics["target_source_counts"] == {"wrapper": 1}
+
+
 def test_load_instruction_records_rebases_stale_absolute_paths(tmp_path: Path) -> None:
     repo_root = tmp_path / "galaxy-toolsmith"
     expanded_path = repo_root / ".gtsm-cache" / "datasets" / "expanded" / "pkg" / "tool.xml"
@@ -497,6 +578,51 @@ def main():
     assert diagnostics["source_context_records"] == 1
     assert diagnostics["source_context_files"] >= 1
     assert diagnostics["source_context_chars"] > 0
+
+
+def test_load_instruction_records_uses_training_data_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_records = []
+    for index in range(2):
+        wrapper_path = tmp_path / f"wrapper-{index}.xml"
+        wrapper_path.write_text(
+            (
+                f'<tool id="worker_tool_{index}" name="Worker {index}">'
+                f"<command>worker-{index}</command></tool>"
+            ),
+            encoding="utf-8",
+        )
+        corpus_records.append(
+            {
+                "tool_name": f"worker_tool_{index}",
+                "wrapper_path": str(wrapper_path),
+                "help_text": f"worker help {index}",
+            }
+        )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in corpus_records) + "\n",
+        encoding="utf-8",
+    )
+    progress: list[dict[str, object]] = []
+    monkeypatch.setenv("GTSM_TRAIN_DATA_WORKERS", "2")
+
+    records, diagnostics = _load_instruction_records_with_diagnostics(
+        corpus_jsonl,
+        _training_profile(),
+        repo_root=tmp_path,
+        progress_callback=progress.append,
+    )
+
+    assert [record["output"] for record in records] == [
+        '<tool id="worker_tool_0" name="Worker 0"><command>worker-0</command></tool>',
+        '<tool id="worker_tool_1" name="Worker 1"><command>worker-1</command></tool>',
+    ]
+    assert diagnostics["training_data_workers"] == 2
+    assert diagnostics["target_source_counts"] == {"wrapper": 2}
+    assert any(item.get("worker_count") == 2 for item in progress)
 
 
 def test_load_instruction_records_supports_udt_yaml_targets(tmp_path: Path) -> None:
@@ -603,6 +729,176 @@ outputs:
         "udt_yaml_generate:udt_yaml": 1,
         "udt_to_xml:paired": 1,
     }
+
+
+def test_estimate_training_tokens_reports_mixed_tasks_and_thresholds(tmp_path: Path) -> None:
+    xml_path = tmp_path / "tool.xml"
+    xml_path.write_text(
+        '<tool id="echo_tool" name="Echo Tool"><command>echo</command></tool>',
+        encoding="utf-8",
+    )
+    udt_path = tmp_path / "tool.yml"
+    udt_path.write_text(
+        """
+class: GalaxyUserTool
+id: echo_tool
+version: "0.1.0"
+name: Echo Tool
+container: busybox
+shell_command: echo hi > output.txt
+outputs:
+  - name: output
+    type: data
+    format: txt
+    from_work_dir: output.txt
+""".strip(),
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "echo_tool",
+                "expanded_xml_path": str(xml_path),
+                "udt_yaml_path": str(udt_path),
+                "help_text": "echo help",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = estimate_training_tokens(
+        profile=_training_profile(),
+        corpus_jsonl_path=corpus_jsonl,
+        repo_root=tmp_path,
+        artifact_format="mixed",
+        max_seq_lengths=(16, 4096),
+        chars_per_token=1.0,
+    )
+
+    estimate = result["estimates"][0]
+    assert estimate["samples"] == 3
+    assert estimate["by_task"] == {
+        "udt_to_xml": 1,
+        "udt_yaml_generate": 1,
+        "xml_generate": 1,
+    }
+    assert estimate["thresholds"][0]["max_seq_length"] == 16
+    assert estimate["thresholds"][0]["over_max_seq_length"] > 0
+    assert estimate["thresholds"][1]["max_seq_length"] == 4096
+    assert estimate["thresholds"][1]["over_max_seq_length"] == 0
+    assert result["recommendation"]["max_seq_length"] == 4096
+
+
+def test_estimate_training_tokens_builds_source_variants_once_per_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "cli.py").write_text("from argparse import ArgumentParser\n", encoding="utf-8")
+    xml_path = tmp_path / "tool.xml"
+    xml_path.write_text(
+        '<tool id="echo_tool" name="Echo Tool"><command>echo</command></tool>',
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "echo_tool",
+                "expanded_xml_path": str(xml_path),
+                "help_text": "echo help",
+                "bioconda_sources": [{"source_checkout": str(source_root), "package": "echo"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+    original = training_estimates_mod.build_source_context_variants_from_record
+
+    def wrapped(record, settings):
+        calls.append(len(settings))
+        return original(record, settings)
+
+    monkeypatch.setattr(
+        training_estimates_mod,
+        "build_source_context_variants_from_record",
+        wrapped,
+    )
+
+    result = estimate_training_tokens(
+        profile=_training_profile(),
+        corpus_jsonl_path=corpus_jsonl,
+        repo_root=tmp_path,
+        artifact_format="xml",
+        source_context_settings=source_context_settings(mode="all-filtered"),
+        source_context_modes=("all-filtered",),
+        max_seq_lengths=(4096, 8192),
+        source_context_budget_ladder=True,
+        chars_per_token=1.0,
+        workers=1,
+    )
+
+    assert calls == [2]
+    assert len(result["estimates"]) == 2
+
+
+def test_estimate_training_tokens_parallel_matches_serial(tmp_path: Path) -> None:
+    xml_path = tmp_path / "tool.xml"
+    xml_path.write_text(
+        '<tool id="echo_tool" name="Echo Tool"><command>echo</command></tool>',
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "tool_name": f"echo_tool_{index}",
+                    "expanded_xml_path": str(xml_path),
+                    "help_text": "echo help",
+                }
+            )
+            for index in range(3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    serial = estimate_training_tokens(
+        profile=_training_profile(),
+        corpus_jsonl_path=corpus_jsonl,
+        repo_root=tmp_path,
+        artifact_format="xml",
+        max_seq_lengths=(4096, 8192),
+        chars_per_token=1.0,
+        workers=1,
+    )
+    parallel = estimate_training_tokens(
+        profile=_training_profile(),
+        corpus_jsonl_path=corpus_jsonl,
+        repo_root=tmp_path,
+        artifact_format="xml",
+        max_seq_lengths=(4096, 8192),
+        chars_per_token=1.0,
+        workers=2,
+    )
+
+    assert serial["estimates"] == parallel["estimates"]
+    assert serial["recommendation"] == parallel["recommendation"]
+
+
+def test_parse_context_lengths_accepts_k_suffix() -> None:
+    assert parse_context_lengths("12k,16384,24k") == (12288, 16384, 24576)
+
+
+def test_source_budget_ladder_includes_low_context_fallbacks() -> None:
+    assert DEFAULT_SOURCE_BUDGET_LADDER[8192] == (12000, 64)
+    assert DEFAULT_SOURCE_BUDGET_LADDER[4096] == (6000, 32)
+    assert DEFAULT_SOURCE_BUDGET_LADDER[2048] == (3000, 16)
 
 
 def test_axolotl_command_adds_accelerate_processes(tmp_path: Path) -> None:
@@ -825,6 +1121,18 @@ def test_axolotl_config_adds_deepspeed_strategy(tmp_path: Path) -> None:
     assert "fsdp" not in config
 
 
+def test_axolotl_config_adds_max_steps_for_probe_runs(tmp_path: Path) -> None:
+    config = _axolotl_config(
+        profile=_training_profile(),
+        train_jsonl_path=tmp_path / "train.jsonl",
+        prepared_dir=tmp_path / "prepared",
+        output_dir=tmp_path / "output",
+        max_steps=5,
+    )
+
+    assert config["max_steps"] == 5
+
+
 def test_deepspeed_zero3_config_can_enable_cpu_offload() -> None:
     config = _deepspeed_zero3_config(offload=True)
 
@@ -855,6 +1163,7 @@ def test_axolotl_runtime_compat_injects_mistral_sitecustomize(tmp_path: Path) ->
         source_policy=_SourcePolicy(),
         compat_sitecustomize_path=sitecustomize_path,
     )
+    assert env["PATH"].split(os.pathsep)[0] == str(Path(training_mod.sys.executable).parent)
     assert env["PYTHONPATH"].split(os.pathsep)[0] == str(sitecustomize_path.parent)
 
 
@@ -902,6 +1211,7 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
         status_interval_seconds=15,
         stream_logs=True,
         log_tail_lines=7,
+        max_steps=5,
     )
 
     assert command[:4] == [command[0], "-m", "torch.distributed.run", "--standalone"]
@@ -921,6 +1231,8 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
     assert "2e-05" in command
     assert "--training-method" in command
     assert "full" in command
+    assert "--max-steps" in command
+    assert "5" in command
     assert "--status-log" in command
     assert str(tmp_path / "train.status.jsonl") in command
     assert "--stream-logs" in command
@@ -962,11 +1274,13 @@ def test_hf_sft_args_use_profile_overrides(tmp_path: Path) -> None:
         sft_config_cls=FakeSFTConfig,
         profile=profile,
         checkpoints_dir=tmp_path / "checkpoints",
+        max_steps=5,
     )
 
     assert args.kwargs["max_length"] == 4096
     assert args.kwargs["per_device_train_batch_size"] == 1
     assert args.kwargs["gradient_accumulation_steps"] == 2
+    assert args.kwargs["max_steps"] == 5
 
 
 def test_build_sft_trainer_supports_legacy_trl_kwargs(tmp_path: Path) -> None:
@@ -1331,6 +1645,18 @@ def test_mlx_lm_config_supports_full_training(tmp_path: Path) -> None:
     assert "lora_parameters" not in config
 
 
+def test_mlx_lm_config_uses_max_steps_for_probe_runs(tmp_path: Path) -> None:
+    config = _mlx_lm_config(
+        profile=_training_profile(),
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "output",
+        sample_count=100,
+        max_steps=7,
+    )
+
+    assert config["iters"] == 7
+
+
 def test_run_training_axolotl_dry_run_applies_non_quantized_overrides(tmp_path: Path) -> None:
     paths = WorkspacePaths.from_repo_root(tmp_path)
     paths.create_directories()
@@ -1562,6 +1888,9 @@ def test_run_training_axolotl_managed_process_writes_live_metrics(
             self.pid = 4321
             self.poll_count = 0
             assert env["HF_HOME"] == str(paths.models_root / "hf-cache")
+            assert env["PATH"].split(os.pathsep)[0] == str(
+                Path(training_mod.sys.executable).parent
+            )
             stdout.write("started\nloading\n")
             stderr.write("warning\n")
             stdout.flush()

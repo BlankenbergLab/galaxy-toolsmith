@@ -232,6 +232,45 @@ def test_server_generate_supports_udt_yaml(tmp_path: Path) -> None:
     assert payload["validation"]["artifact_valid"] is True
 
 
+def test_server_suite_plan_endpoint(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, allow_stub_local=True)
+
+    response = client.post(
+        "/suite/plan",
+        json={
+            "tool_name": "samtools",
+            "help_text": "Usage: samtools {view,sort}\n",
+            "max_suite_tools": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["suite_recommended"] is True
+    assert [tool["tool_id"] for tool in payload["tools"]] == ["samtools_view", "samtools_sort"]
+
+
+def test_server_generate_suite_endpoint_returns_artifacts(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, allow_stub_local=True)
+
+    response = client.post(
+        "/generate-suite",
+        json={
+            "tool_name": "samtools",
+            "help_text": "Usage: samtools {view,sort}\n",
+            "allow_stub_local": True,
+            "max_suite_tools": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    artifact_paths = {artifact["relative_path"] for artifact in payload["artifacts"]}
+    assert "samtools_view.xml" in artifact_paths
+    assert "samtools_sort.xml" in artifact_paths
+    assert ".shed.yml" in artifact_paths
+
+
 def test_server_monitoring_writes_status_log_when_enabled(tmp_path: Path) -> None:
     paths = WorkspacePaths.from_repo_root(tmp_path)
     paths.create_directories()

@@ -5,8 +5,11 @@ import json
 import os
 import shlex
 import subprocess
+import sys
+import threading
 from collections.abc import Mapping
 from pathlib import Path
+from queue import Empty
 
 from galaxy_toolsmith.core.paths import WorkspacePaths
 from galaxy_toolsmith.inference.artifacts import (
@@ -18,8 +21,9 @@ from galaxy_toolsmith.prompts import render_prompt_template
 from galaxy_toolsmith.providers.base import (
     GenerationInput,
     GenerationOutput,
-    extract_generated_artifact,
+    generation_output_from_response,
     generation_prompt_task,
+    write_raw_response_log,
 )
 from galaxy_toolsmith.runtime.model_source import (
     apply_model_source_environment,
@@ -43,6 +47,7 @@ def _render_generation_prompt(request: GenerationInput) -> str:
             "skills_profile": request.skills_profile,
             "repair_context": request.repair_context,
             "interface_hints": request.interface_hints,
+            "generate_sidecars": request.generate_sidecars,
         },
     )
 
@@ -88,9 +93,82 @@ def _decode_model_response(
             model_generate_kwargs["stopping_criteria"] = stopping_criteria
     if temperature > 0:
         model_generate_kwargs["temperature"] = temperature
+    if request.stream_output:
+        streamed = _stream_model_response(
+            model=model,
+            tokenizer=tokenizer,
+            model_generate_kwargs=model_generate_kwargs,
+            request=request,
+        )
+        if streamed is not None:
+            return streamed
     outputs = model.generate(**model_generate_kwargs)
     new_tokens = outputs[0][input_length:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True)
+    response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    write_raw_response_log(request, response)
+    return response
+
+
+def _stream_model_response(
+    *,
+    model: object,
+    tokenizer: object,
+    model_generate_kwargs: dict,
+    request: GenerationInput,
+) -> str | None:
+    try:
+        from transformers import TextIteratorStreamer
+    except Exception:  # pragma: no cover - optional runtime integration
+        return None
+
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        timeout=1.0,
+    )
+    generate_kwargs = {**model_generate_kwargs, "streamer": streamer}
+    errors: list[BaseException] = []
+
+    def run_generate() -> None:
+        try:
+            model.generate(**generate_kwargs)
+        except BaseException as error:  # pragma: no cover - surfaced after streaming
+            errors.append(error)
+
+    thread = threading.Thread(target=run_generate, daemon=True)
+    thread.start()
+    chunks: list[str] = []
+    log_handle = None
+    if request.raw_response_log_path:
+        log_path = Path(request.raw_response_log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("w", encoding="utf-8")
+    try:
+        iterator = iter(streamer)
+        while True:
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                break
+            except Empty:
+                if errors or not thread.is_alive():
+                    break
+                continue
+            text = str(chunk)
+            chunks.append(text)
+            if log_handle is not None:
+                log_handle.write(text)
+                log_handle.flush()
+            sys.stderr.write(text)
+            sys.stderr.flush()
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+        thread.join()
+    if errors:
+        raise RuntimeError(f"Local streaming generation failed: {errors[0]}") from errors[0]
+    return "".join(chunks)
 
 
 def _tool_xml_stopping_criteria(*, tokenizer: object, input_length: int) -> object | None:
@@ -303,19 +381,18 @@ class LocalUnslothProvider:
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
         )
-        artifact = extract_generated_artifact(response_text, request.artifact_format)
-        if not artifact:
+        output = generation_output_from_response(
+            response_text=response_text,
+            request=request,
+            provider=self.name,
+        )
+        if not output.artifact_text:
             raise RuntimeError(
                 "LocalUnslothProvider returned empty output after artifact stripping; "
                 f"raw_response_length={len(response_text)} "
                 f"raw_response_preview={_preview_text(response_text)!r}"
             )
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
-            provider=self.name,
-            model_variant=request.model_variant,
-        )
+        return output
 
 
 class LocalPeftProvider:
@@ -427,20 +504,19 @@ class LocalPeftProvider:
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
         )
-        artifact = extract_generated_artifact(response_text, request.artifact_format)
-        if not artifact:
+        output = generation_output_from_response(
+            response_text=response_text,
+            request=request,
+            provider=self.name,
+        )
+        if not output.artifact_text:
             raise RuntimeError(
                 "LocalPeftProvider returned empty output after artifact stripping; "
                 f"base_model={self.base_model!r} adapter_path={self.adapter_path!r} "
                 f"raw_response_length={len(response_text)} "
                 f"raw_response_preview={_preview_text(response_text)!r}"
             )
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
-            provider=self.name,
-            model_variant=request.model_variant,
-        )
+        return output
 
 
 class LocalMLXProvider:
@@ -519,20 +595,19 @@ class LocalMLXProvider:
             sampler=make_sampler(self.temperature),
             verbose=False,
         )
-        artifact = extract_generated_artifact(response_text, request.artifact_format)
-        if not artifact:
+        output = generation_output_from_response(
+            response_text=response_text,
+            request=request,
+            provider=self.name,
+        )
+        if not output.artifact_text:
             raise RuntimeError(
                 "LocalMLXProvider returned empty output after artifact stripping; "
                 f"base_model={self.base_model!r} adapter_path={self.adapter_path!r} "
                 f"raw_response_length={len(response_text)} "
                 f"raw_response_preview={_preview_text(response_text)!r}"
             )
-        return GenerationOutput(
-            artifact_text=artifact,
-            artifact_format=request.artifact_format,
-            provider=self.name,
-            model_variant=request.model_variant,
-        )
+        return output
 
 
 def _mlx_prompt(tokenizer: object, prompt: str) -> object:
@@ -585,7 +660,7 @@ class LocalProvider:
         self._peft_providers: dict[str, LocalPeftProvider] = {}
         self._mlx_providers: dict[str, LocalMLXProvider] = {}
 
-    def _run_external_local_command(self, request: GenerationInput) -> str:
+    def _run_external_local_command(self, request: GenerationInput) -> GenerationOutput:
         payload = {
             "tool_name": request.tool_name,
             "help_text": request.help_text,
@@ -609,10 +684,14 @@ class LocalProvider:
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(f"Local generator command failed with exit code {completed.returncode}: {detail}")
-        artifact = extract_generated_artifact(completed.stdout, request.artifact_format)
-        if not artifact:
+        output = generation_output_from_response(
+            response_text=completed.stdout,
+            request=request,
+            provider=self.name,
+        )
+        if not output.artifact_text:
             raise RuntimeError("Local generator command returned empty output.")
-        return artifact
+        return output
 
     def _manifest_path(self, model_variant: str) -> Path | None:
         if self.paths is None:
@@ -773,13 +852,7 @@ class LocalProvider:
 
     def generate_wrapper(self, request: GenerationInput) -> GenerationOutput:
         if self.command:
-            artifact = self._run_external_local_command(request)
-            return GenerationOutput(
-                artifact_text=artifact,
-                artifact_format=request.artifact_format,
-                provider=self.name,
-                model_variant=request.model_variant,
-            )
+            return self._run_external_local_command(request)
         if self.unsloth_provider is not None:
             return self.unsloth_provider.generate_wrapper(request)
 

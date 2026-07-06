@@ -405,6 +405,41 @@ def test_generate_wrapper_cli_writes_monitor_run(
     assert runs["runs"][0]["summary"]["validation"]["root_is_tool"] is True
 
 
+def test_generate_wrapper_cli_repository_output_writes_shed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run_registry, "collect_environment_snapshot", lambda cwd=None: {})
+    help_text = tmp_path / "help.txt"
+    help_text.write_text("Usage: echo_tool --input FILE\n", encoding="utf-8")
+    repo_dir = tmp_path / "repo"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "gtsm",
+            "--repo-root",
+            str(tmp_path),
+            "generate-wrapper",
+            "--tool-name",
+            "echo_tool",
+            "--help-text-file",
+            str(help_text),
+            "--repository-output-dir",
+            str(repo_dir),
+            "--shed-owner",
+            "iuc",
+            "--allow-stub-local",
+        ],
+    )
+
+    assert cli_main.main() == 0
+    assert (repo_dir / "echo_tool.xml").exists()
+    shed_text = (repo_dir / ".shed.yml").read_text(encoding="utf-8")
+    assert "name: echo_tool" in shed_text
+    assert "owner: iuc" in shed_text
+    assert (repo_dir / ".gtsm" / "generation-record.json").exists()
+
+
 def test_serve_process_discovery_filters_to_matching_servers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

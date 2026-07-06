@@ -9,8 +9,8 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from galaxy_toolsmith.inference.artifacts import (
-    ARTIFACT_FORMAT_XML,
     ARTIFACT_FORMAT_UDT_YAML,
+    ARTIFACT_FORMAT_XML,
     normalize_artifact_format,
 )
 from galaxy_toolsmith.inference.udt import udt_structural_report, validate_udt_yaml

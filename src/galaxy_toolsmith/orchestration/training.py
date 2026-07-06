@@ -8,10 +8,13 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields, replace
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import yaml
 
@@ -161,11 +164,17 @@ def _normalize_quantization(profile: TrainingProfile) -> str:
     return profile.quantization.strip().lower()
 
 
-def _effective_training_method(profile: TrainingProfile, selected_backend: str | None = None) -> str:
+def _effective_training_method(
+    profile: TrainingProfile, selected_backend: str | None = None
+) -> str:
     method = normalize_training_method(profile.training_method)
     quantization = _normalize_quantization(profile)
     backend = str(selected_backend or profile.backend).strip().lower()
-    if method == "lora" and quantization in FOUR_BIT_QUANTIZATIONS and backend not in MLX_LM_BACKEND_ALIASES:
+    if (
+        method == "lora"
+        and quantization in FOUR_BIT_QUANTIZATIONS
+        and backend not in MLX_LM_BACKEND_ALIASES
+    ):
         return "qlora"
     return method
 
@@ -316,6 +325,7 @@ class TrainingBackend:
         distributed_strategy: str = "ddp",
         artifact_format: str = ARTIFACT_FORMAT_XML,
         source_context_settings: SourceContextSettings | None = None,
+        max_steps: int | None = None,
     ) -> BackendResult:
         raise NotImplementedError
 
@@ -325,6 +335,10 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def _training_data_worker_count() -> int:
+    return max(1, _env_int("GTSM_TRAIN_DATA_WORKERS", 1))
 
 
 def _distributed_context(distributed_child: bool) -> DistributedTrainingContext:
@@ -599,6 +613,45 @@ def _write_live_training_metrics(
     _write_json_file(metrics_path, {**(base_metrics or {}), **backend_metrics})
 
 
+def _record_training_runtime_probe_text(record: dict) -> str:
+    accepted_statuses = {
+        "container-command-help",
+        "container-command-help-degraded",
+        "container-command-usage-degraded",
+    }
+    sections: list[str] = []
+    for event in (record.get("container_execution", []) or [])[:64]:
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("status", "") or "")
+        if status not in accepted_statuses:
+            continue
+        command = str(event.get("command", "") or "").strip()
+        if not command:
+            continue
+        output = "\n".join(
+            part.strip()
+            for part in (
+                str(event.get("stdout", "") or ""),
+                str(event.get("stderr", "") or ""),
+            )
+            if part and str(part).strip()
+        ).strip()
+        metadata = [
+            f"Command: {command}",
+            f"Probe role: {event.get('probe_role', '') or 'unknown'}",
+            f"Status: {status}",
+        ]
+        if output:
+            metadata.extend(["Output excerpt:", output[:2500]])
+        sections.append("\n".join(metadata))
+        if len(sections) >= 12:
+            break
+    if not sections:
+        return ""
+    return "Structured runtime help probes:\n\n" + "\n\n".join(sections)
+
+
 def _record_training_help_text(record: dict) -> str:
     help_text = str(record.get("help_text", "")).strip()
     runtime_sections = [
@@ -610,6 +663,7 @@ def _record_training_help_text(record: dict) -> str:
             "Command-line usage collected from container execution",
             str(record.get("container_usage_text", "")).strip(),
         ),
+        ("Structured runtime help probe commands", _record_training_runtime_probe_text(record)),
     ]
     sections: list[str] = []
     if help_text:
@@ -672,6 +726,98 @@ def _xml_target_candidates(
     return _dedupe_paths(candidates)
 
 
+def _xml_root_tag(text: str) -> str:
+    try:
+        return str(ET.fromstring(text).tag)
+    except ET.ParseError:
+        return ""
+
+
+def _record_training_sidecar_context(record: dict) -> str:
+    lines: list[str] = []
+    shed_payload: dict[str, Any] = {}
+    shed_name = str(record.get("shed_name") or "").strip()
+    shed_owner = str(record.get("shed_owner") or "").strip()
+    shed_description = str(record.get("shed_description") or "").strip()
+    shed_homepage_url = str(record.get("shed_homepage_url") or "").strip()
+    shed_remote_repository_url = str(record.get("shed_remote_repository_url") or "").strip()
+    shed_categories = record.get("shed_categories", [])
+    suite_members = record.get("suite_members", [])
+    if shed_name:
+        shed_payload["name"] = shed_name
+    if shed_owner:
+        shed_payload["owner"] = shed_owner
+    if shed_description:
+        shed_payload["description"] = shed_description
+    if shed_homepage_url:
+        shed_payload["homepage_url"] = shed_homepage_url
+    if shed_remote_repository_url:
+        shed_payload["remote_repository_url"] = shed_remote_repository_url
+    if isinstance(shed_categories, list) and shed_categories:
+        shed_payload["categories"] = [str(item) for item in shed_categories if str(item).strip()]
+    if record.get("is_suite_root"):
+        shed_payload["type"] = "suite_repository"
+        if isinstance(suite_members, list) and suite_members:
+            shed_payload["repositories"] = [
+                {"name": str(member)} for member in suite_members if str(member).strip()
+            ]
+    if shed_payload:
+        shed_text = yaml.safe_dump(shed_payload, sort_keys=False).strip()
+        lines.extend(
+            [
+                "Tool Shed repository metadata (.shed.yml context):",
+                "This metadata describes the repository and is not the primary generated wrapper.",
+                "```yaml",
+                shed_text[:4000],
+                "```",
+            ]
+        )
+    raw_sidecars = record.get("wrapper_sidecar_files", [])
+    sidecars = raw_sidecars if isinstance(raw_sidecars, list) else []
+    if sidecars:
+        if lines:
+            lines.append("")
+        lines.extend(
+            [
+                "Companion Galaxy sidecar artifacts:",
+                "These files may be referenced by the primary <tool>, but they are not the primary wrapper.",
+            ]
+        )
+    for item in sidecars[:12]:
+        if not isinstance(item, dict):
+            continue
+        relpath = str(item.get("relative_path") or item.get("path") or "").strip()
+        role = str(item.get("role") or "sidecar").strip()
+        root_tag = str(item.get("root_tag") or "").strip()
+        byte_count = str(item.get("byte_count") or "").strip()
+        if not relpath:
+            continue
+        details = [f"role={role}"]
+        if root_tag:
+            details.append(f"root=<{root_tag}>")
+        if byte_count:
+            details.append(f"bytes={byte_count}")
+        lines.append(f"- {relpath} ({'; '.join(details)})")
+        content = str(item.get("content") or "").strip()
+        if content:
+            lines.append("```")
+            lines.append(content[:4000])
+            lines.append("```")
+    if isinstance(suite_members, list) and len(suite_members) > 1:
+        members = ", ".join(str(member) for member in suite_members[:20] if str(member).strip())
+        if members:
+            if lines:
+                lines.append("")
+            lines.extend(
+                [
+                    "Related suite tools:",
+                    members,
+                    "Treat sibling suite members as separate primary Galaxy tools, not as sidecars.",
+                ]
+            )
+    return "\n".join(lines).strip()
+
+
 def _training_data_diagnostics() -> dict[str, Any]:
     return {
         "total_corpus_records": 0,
@@ -681,6 +827,7 @@ def _training_data_diagnostics() -> dict[str, Any]:
         "missing_xml_path_count": 0,
         "missing_xml_target_count": 0,
         "empty_xml_target_count": 0,
+        "skipped_non_tool_xml_target_count": 0,
         "missing_udt_path_count": 0,
         "missing_udt_target_count": 0,
         "empty_udt_target_count": 0,
@@ -692,8 +839,13 @@ def _training_data_diagnostics() -> dict[str, Any]:
         "source_context_files": 0,
         "source_context_truncated_records": 0,
         "source_context_error_records": 0,
+        "records_with_shed_metadata": 0,
+        "records_with_suite_metadata": 0,
+        "records_with_repository_sidecars": 0,
+        "skipped_non_primary_repository_metadata_targets": 0,
         "missing_xml_target_examples": [],
         "empty_xml_target_examples": [],
+        "skipped_non_tool_xml_target_examples": [],
         "missing_udt_target_examples": [],
         "empty_udt_target_examples": [],
     }
@@ -722,6 +874,7 @@ def _resolve_training_xml_target(
         diagnostics["missing_xml_path_count"] += 1
         return None, "", ""
 
+    tool_name = str(record.get("tool_name", "")).strip()
     existing_empty: list[Path] = []
     for path, source in candidates:
         if not path.exists():
@@ -730,9 +883,23 @@ def _resolve_training_xml_target(
         if not xml_target:
             existing_empty.append(path)
             continue
+        root_tag = _xml_root_tag(xml_target)
+        if root_tag != "tool":
+            diagnostics["skipped_non_tool_xml_target_count"] += 1
+            _add_limited_example(
+                diagnostics,
+                "skipped_non_tool_xml_target_examples",
+                {
+                    "tool_name": tool_name,
+                    "expanded_xml_path": expanded_raw,
+                    "wrapper_path": wrapper_raw,
+                    "first_non_tool_path": str(path),
+                    "first_non_tool_root": root_tag or "parse_error",
+                },
+            )
+            continue
         return path, source, xml_target
 
-    tool_name = str(record.get("tool_name", "")).strip()
     if existing_empty:
         diagnostics["empty_xml_target_count"] += 1
         _add_limited_example(
@@ -835,6 +1002,7 @@ def _append_training_sample(
             "help_text": _record_training_help_text(record),
             "source_code": source_code,
             "skills_profile": profile.skills_profile,
+            "generate_sidecars": False,
         },
     )
     records.append(
@@ -892,6 +1060,156 @@ def _append_conversion_training_sample(
     )
 
 
+def _merge_training_data_diagnostics(
+    target: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    for key, value in source.items():
+        if key == "target_source_counts" and isinstance(value, dict):
+            target_counts = target.setdefault("target_source_counts", {})
+            for source_key, count in value.items():
+                target_counts[source_key] = int(target_counts.get(source_key, 0)) + int(count)
+            continue
+        if key.endswith("_examples") and isinstance(value, list):
+            target_examples = target.setdefault(key, [])
+            if isinstance(target_examples, list):
+                remaining = max(0, 10 - len(target_examples))
+                target_examples.extend(value[:remaining])
+            continue
+        if key in {"artifact_format", "source_context_mode"}:
+            target[key] = value
+            continue
+        if isinstance(value, int):
+            target[key] = int(target.get(key, 0) or 0) + value
+            continue
+        if key not in target:
+            target[key] = value
+
+
+def _training_samples_from_record(
+    record: dict,
+    *,
+    profile: TrainingProfile,
+    repo_root: Path,
+    artifact_format: str,
+    source_context_settings: SourceContextSettings,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    records: list[dict[str, str]] = []
+    diagnostics = _training_data_diagnostics()
+    diagnostics["total_corpus_records"] = 1
+    diagnostics["artifact_format"] = artifact_format
+    diagnostics["source_context_mode"] = source_context_settings.mode
+    tool_name = str(record.get("tool_name", "")).strip()
+    if not tool_name:
+        diagnostics["missing_tool_name_count"] += 1
+        return records, diagnostics
+    if any(
+        str(record.get(key) or "").strip()
+        for key in (
+            "shed_name",
+            "shed_owner",
+            "shed_description",
+            "shed_homepage_url",
+            "shed_remote_repository_url",
+        )
+    ) or record.get("shed_categories"):
+        diagnostics["records_with_shed_metadata"] += 1
+    suite_members = record.get("suite_members", [])
+    if record.get("is_suite_root") or (isinstance(suite_members, list) and len(suite_members) > 1):
+        diagnostics["records_with_suite_metadata"] += 1
+    sidecars = record.get("wrapper_sidecar_files", [])
+    if isinstance(sidecars, list) and sidecars:
+        diagnostics["records_with_repository_sidecars"] += 1
+
+    xml_path: Path | None = None
+    xml_source = ""
+    xml_target = ""
+    udt_path: Path | None = None
+    udt_source = ""
+    udt_target = ""
+    if artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}:
+        xml_path, xml_source, xml_target = _resolve_training_xml_target(
+            record,
+            repo_root=repo_root,
+            diagnostics=diagnostics,
+        )
+    if artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}:
+        udt_path, udt_source, udt_target = _resolve_training_udt_target(
+            record,
+            repo_root=repo_root,
+            diagnostics=diagnostics,
+        )
+
+    has_trainable_target = (
+        artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
+        and xml_path is not None
+        and bool(xml_target)
+    ) or (
+        artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}
+        and udt_path is not None
+        and bool(udt_target)
+    )
+    source_code = str(record.get("documentation", ""))
+    if has_trainable_target:
+        source_context = build_source_context_from_record(record, source_context_settings)
+        _update_source_context_diagnostics(diagnostics, source_context)
+        if source_context_settings.mode != "none":
+            source_code = source_context.text
+        sidecar_context = _record_training_sidecar_context(record)
+        if sidecar_context:
+            source_code = "\n\n".join(part for part in (source_code, sidecar_context) if part)
+
+    if (
+        artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
+        and xml_path is not None
+        and xml_target
+    ):
+        _append_training_sample(
+            records,
+            diagnostics=diagnostics,
+            target_source=xml_source,
+            task="xml_generate",
+            profile=profile,
+            record=record,
+            tool_name=tool_name,
+            output=xml_target,
+            source_code=source_code,
+        )
+    if (
+        artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}
+        and udt_path is not None
+        and udt_target
+    ):
+        _append_training_sample(
+            records,
+            diagnostics=diagnostics,
+            target_source=udt_source,
+            task="udt_yaml_generate",
+            profile=profile,
+            record=record,
+            tool_name=tool_name,
+            output=udt_target,
+            source_code=source_code,
+        )
+    if (
+        artifact_format == TRAINING_ARTIFACT_FORMAT_MIXED
+        and udt_path is not None
+        and udt_target
+        and xml_path is not None
+        and xml_target
+    ):
+        _append_conversion_training_sample(
+            records,
+            diagnostics=diagnostics,
+            profile=profile,
+            tool_name=tool_name,
+            udt_target=udt_target,
+            xml_target=xml_target,
+        )
+    diagnostics["trainable_samples"] = len(records)
+    return records, diagnostics
+
+
 def _load_instruction_records_with_diagnostics(
     corpus_jsonl_path: Path,
     profile: TrainingProfile,
@@ -899,9 +1217,13 @@ def _load_instruction_records_with_diagnostics(
     repo_root: Path | None = None,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    limit: int | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not corpus_jsonl_path.exists():
         raise FileNotFoundError(f"Corpus JSONL not found: {corpus_jsonl_path}")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1 when provided.")
 
     repo_root = (repo_root or Path.cwd()).resolve()
     records: list[dict[str, str]] = []
@@ -910,103 +1232,84 @@ def _load_instruction_records_with_diagnostics(
     diagnostics = _training_data_diagnostics()
     diagnostics["artifact_format"] = artifact_format
     diagnostics["source_context_mode"] = source_context_settings.mode
+    parsed_records: list[dict[str, Any]] = []
+    seen_corpus_records = 0
     with corpus_jsonl_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
-            diagnostics["total_corpus_records"] += 1
+            seen_corpus_records += 1
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                diagnostics["total_corpus_records"] += 1
                 diagnostics["invalid_json_records"] += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "records_seen": diagnostics["total_corpus_records"],
+                            "trainable_samples": len(records),
+                        }
+                    )
                 continue
-            tool_name = str(record.get("tool_name", "")).strip()
-            if not tool_name:
-                diagnostics["missing_tool_name_count"] += 1
-                continue
-            xml_path: Path | None = None
-            xml_source = ""
-            xml_target = ""
-            udt_path: Path | None = None
-            udt_source = ""
-            udt_target = ""
-            if artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}:
-                xml_path, xml_source, xml_target = _resolve_training_xml_target(
-                    record,
-                    repo_root=repo_root,
-                    diagnostics=diagnostics,
-                )
-            if artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}:
-                udt_path, udt_source, udt_target = _resolve_training_udt_target(
-                    record,
-                    repo_root=repo_root,
-                    diagnostics=diagnostics,
-                )
+            parsed_records.append(record)
+            if limit is not None and seen_corpus_records >= limit:
+                break
 
-            has_trainable_target = (
-                artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
-                and xml_path is not None
-                and bool(xml_target)
-            ) or (
-                artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}
-                and udt_path is not None
-                and bool(udt_target)
-            )
-            source_code = str(record.get("documentation", ""))
-            if has_trainable_target:
-                source_context = build_source_context_from_record(record, source_context_settings)
-                _update_source_context_diagnostics(diagnostics, source_context)
-                if source_context_settings.mode != "none":
-                    source_code = source_context.text
+    worker_count = min(_training_data_worker_count(), max(1, len(parsed_records)))
+    diagnostics["training_data_workers"] = worker_count
 
-            if (
-                artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
-                and xml_path is not None
-                and xml_target
-            ):
-                _append_training_sample(
-                    records,
-                    diagnostics=diagnostics,
-                    target_source=xml_source,
-                    task="xml_generate",
-                    profile=profile,
-                    record=record,
-                    tool_name=tool_name,
-                    output=xml_target,
-                    source_code=source_code,
+    def process(record: dict[str, Any]) -> tuple[list[dict[str, str]], dict[str, Any]]:
+        return _training_samples_from_record(
+            record,
+            profile=profile,
+            repo_root=repo_root,
+            artifact_format=artifact_format,
+            source_context_settings=source_context_settings,
+        )
+
+    completed_records = 0
+    if worker_count <= 1:
+        for record in parsed_records:
+            sample_records, record_diagnostics = process(record)
+            records.extend(sample_records)
+            _merge_training_data_diagnostics(diagnostics, record_diagnostics)
+            completed_records += int(record_diagnostics.get("total_corpus_records", 0) or 0)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "records_seen": diagnostics["total_corpus_records"],
+                        "trainable_samples": len(records),
+                        "completed_valid_records": completed_records,
+                        "worker_count": worker_count,
+                    }
                 )
-            if (
-                artifact_format in {ARTIFACT_FORMAT_UDT_YAML, TRAINING_ARTIFACT_FORMAT_MIXED}
-                and udt_path is not None
-                and udt_target
-            ):
-                _append_training_sample(
-                    records,
-                    diagnostics=diagnostics,
-                    target_source=udt_source,
-                    task="udt_yaml_generate",
-                    profile=profile,
-                    record=record,
-                    tool_name=tool_name,
-                    output=udt_target,
-                    source_code=source_code,
-                )
-            if (
-                artifact_format == TRAINING_ARTIFACT_FORMAT_MIXED
-                and udt_path is not None
-                and udt_target
-                and xml_path is not None
-                and xml_target
-            ):
-                _append_conversion_training_sample(
-                    records,
-                    diagnostics=diagnostics,
-                    profile=profile,
-                    tool_name=tool_name,
-                    udt_target=udt_target,
-                    xml_target=xml_target,
-                )
+    else:
+        ordered_results: dict[int, tuple[list[dict[str, str]], dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(process, record): index
+                for index, record in enumerate(parsed_records)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                sample_records, record_diagnostics = future.result()
+                ordered_results[index] = (sample_records, record_diagnostics)
+                _merge_training_data_diagnostics(diagnostics, record_diagnostics)
+                completed_records += int(record_diagnostics.get("total_corpus_records", 0) or 0)
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "records_seen": diagnostics["total_corpus_records"],
+                            "trainable_samples": int(diagnostics.get("trainable_samples", 0) or 0),
+                            "completed_valid_records": completed_records,
+                            "worker_count": worker_count,
+                        }
+                    )
+        for index in range(len(parsed_records)):
+            sample_records, _record_diagnostics = ordered_results[index]
+            records.extend(sample_records)
     diagnostics["trainable_samples"] = len(records)
     if not records:
         raise RuntimeError("No trainable samples found in corpus JSONL.")
@@ -1061,6 +1364,7 @@ class CommandTrainingBackend(TrainingBackend):
         distributed_strategy: str = "ddp",
         artifact_format: str = ARTIFACT_FORMAT_XML,
         source_context_settings: SourceContextSettings | None = None,
+        max_steps: int | None = None,
     ) -> BackendResult:
         del (
             checkpoints_dir,
@@ -1077,6 +1381,7 @@ class CommandTrainingBackend(TrainingBackend):
             log_tail_lines,
             artifact_format,
             source_context_settings,
+            max_steps,
         )
         started_at = utc_now_iso()
         command = command_override if command_override else list(profile.default_command)
@@ -1189,6 +1494,7 @@ def _training_args_kwargs(
     profile: TrainingProfile,
     checkpoints_dir: Path,
     torch_module: object | None = None,
+    max_steps: int | None = None,
 ) -> dict:
     kwargs = {
         "output_dir": str(checkpoints_dir),
@@ -1198,7 +1504,7 @@ def _training_args_kwargs(
         "learning_rate": profile.learning_rate,
         "logging_steps": 10,
         "save_steps": 100,
-        "max_steps": -1,
+        "max_steps": int(max_steps) if max_steps is not None else -1,
         "seed": profile.seed,
         "report_to": [],
         "gradient_checkpointing": True,
@@ -1258,11 +1564,13 @@ def _build_sft_args(
     profile: TrainingProfile,
     checkpoints_dir: Path,
     torch_module: object | None = None,
+    max_steps: int | None = None,
 ) -> object:
     kwargs = _training_args_kwargs(
         profile=profile,
         checkpoints_dir=checkpoints_dir,
         torch_module=torch_module,
+        max_steps=max_steps,
     )
     if sft_config_cls is None:
         return training_arguments_cls(**_supported_kwargs(training_arguments_cls, kwargs))
@@ -1351,6 +1659,7 @@ class HFSFTTrainingBackend(TrainingBackend):
         distributed_strategy: str = "ddp",
         artifact_format: str = ARTIFACT_FORMAT_XML,
         source_context_settings: SourceContextSettings | None = None,
+        max_steps: int | None = None,
     ) -> BackendResult:
         del (
             command_override,
@@ -1499,6 +1808,7 @@ class HFSFTTrainingBackend(TrainingBackend):
             profile=profile,
             checkpoints_dir=checkpoints_dir,
             torch_module=torch,
+            max_steps=max_steps,
         )
 
         trainer = _build_sft_trainer(
@@ -1611,6 +1921,7 @@ def _axolotl_subprocess_environment(
     compat_sitecustomize_path: Path | None,
 ) -> dict[str, str]:
     env = merged_model_source_environment(None, source_policy)
+    _prepend_env_path(env, "PATH", Path(sys.executable).resolve().parent)
     if compat_sitecustomize_path is not None:
         _prepend_env_path(env, "PYTHONPATH", compat_sitecustomize_path.parent)
     return env
@@ -1668,6 +1979,7 @@ def _axolotl_config(
     source_policy: object | None = None,
     distributed_strategy: str = "ddp",
     deepspeed_config_path: Path | None = None,
+    max_steps: int | None = None,
 ) -> dict:
     quantization = profile.quantization.strip().lower()
     is_4bit = quantization in {"4bit", "int4", "bnb-4bit"}
@@ -1706,6 +2018,8 @@ def _axolotl_config(
         "wandb_mode": "disabled",
         "strict": False,
     }
+    if max_steps is not None:
+        config["max_steps"] = int(max_steps)
     if effective_method in {"lora", "qlora"}:
         config.update(
             {
@@ -1787,15 +2101,58 @@ class AxolotlTrainingBackend(TrainingBackend):
         distributed_strategy: str = "ddp",
         artifact_format: str = ARTIFACT_FORMAT_XML,
         source_context_settings: SourceContextSettings | None = None,
+        max_steps: int | None = None,
     ) -> BackendResult:
         del checkpoints_dir, command_override, distributed_context
         started_at = utc_now_iso()
+        last_data_progress_emit = 0.0
+        total_data_records = None
+        if base_metrics is not None:
+            total_data_records = int(base_metrics.get("corpus_records", 0) or 0) or None
+
+        def training_data_progress(progress: dict[str, Any]) -> None:
+            nonlocal last_data_progress_emit
+            now = time.monotonic()
+            if now - last_data_progress_emit < max(0.1, float(status_interval_seconds)):
+                return
+            last_data_progress_emit = now
+            records_seen = int(progress.get("records_seen", 0) or 0)
+            progress_snapshot = make_progress_snapshot(
+                started_at=started_at,
+                completed_units=records_seen,
+                total_units=total_data_records,
+            ).to_dict()
+            payload = {
+                "status": "training-data-progress",
+                "run_id": run_dir.name,
+                "backend": self.name,
+                "total_records": total_data_records,
+                "records_seen": records_seen,
+                "trainable_samples": int(progress.get("trainable_samples", 0) or 0),
+                "completed_valid_records": int(
+                    progress.get("completed_valid_records", records_seen) or 0
+                ),
+                "worker_count": int(progress.get("worker_count", 1) or 1),
+                "progress": progress_snapshot,
+            }
+            _write_live_training_metrics(
+                metrics_path,
+                base_metrics,
+                {
+                    "status": "preparing-training-data",
+                    "training_data_progress": payload,
+                    "progress": progress_snapshot,
+                },
+            )
+            emit_status(payload, status_log_path=status_log_path)
+
         samples, training_data_diagnostics = _load_instruction_records_with_diagnostics(
             corpus_jsonl_path,
             profile,
             repo_root=paths.repo_root,
             artifact_format=artifact_format,
             source_context_settings=source_context_settings,
+            progress_callback=training_data_progress,
         )
         train_jsonl_path = _write_jsonl(run_dir / "axolotl" / "train.jsonl", samples)
         config_path = run_dir / "axolotl" / "axolotl.yml"
@@ -1820,6 +2177,7 @@ class AxolotlTrainingBackend(TrainingBackend):
             source_policy=source_policy,
             distributed_strategy=strategy,
             deepspeed_config_path=deepspeed_config_path,
+            max_steps=max_steps,
         )
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         command = _axolotl_command(config_path=config_path, num_processes=num_processes)
@@ -2025,8 +2383,13 @@ def _mlx_lm_config(
     data_dir: Path,
     output_dir: Path,
     sample_count: int,
+    max_steps: int | None = None,
 ) -> dict:
-    iters = _mlx_lm_training_iterations(profile, sample_count)
+    iters = (
+        int(max_steps)
+        if max_steps is not None
+        else _mlx_lm_training_iterations(profile, sample_count)
+    )
     effective_method = _validate_training_method(profile, MLXLMTrainingBackend.name)
     uses_mistral_common = _profile_uses_mistral_common_tokenizer(profile)
     config = {
@@ -2096,6 +2459,7 @@ class MLXLMTrainingBackend(TrainingBackend):
         distributed_strategy: str = "ddp",
         artifact_format: str = ARTIFACT_FORMAT_XML,
         source_context_settings: SourceContextSettings | None = None,
+        max_steps: int | None = None,
     ) -> BackendResult:
         del checkpoints_dir, command_override, distributed_context, distributed_strategy
         if num_processes != 1:
@@ -2119,6 +2483,7 @@ class MLXLMTrainingBackend(TrainingBackend):
             data_dir=dataset_paths["data_dir"],
             output_dir=output_dir,
             sample_count=len(samples),
+            max_steps=max_steps,
         )
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -2385,6 +2750,7 @@ def _hf_sft_distributed_launch_command(
     log_tail_lines: int = 40,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    max_steps: int | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -2436,6 +2802,8 @@ def _hf_sft_distributed_launch_command(
         command.extend(["--learning-rate", str(overrides.learning_rate)])
     if overrides.training_method is not None:
         command.extend(["--training-method", overrides.training_method])
+    if max_steps is not None:
+        command.extend(["--max-steps", str(max_steps)])
     source_context_settings = (source_context_settings or SourceContextSettings()).normalized()
     if source_context_settings.mode != "none":
         command.extend(["--source-context-mode", source_context_settings.mode])
@@ -2474,10 +2842,13 @@ def run_training(
     log_tail_lines: int = 40,
     artifact_format: str = ARTIFACT_FORMAT_XML,
     source_context_settings: SourceContextSettings | None = None,
+    max_steps: int | None = None,
 ) -> TrainingRunManifest:
     artifact_format = normalize_training_artifact_format(artifact_format)
     if num_processes < 1:
         raise ValueError("--num-processes must be at least 1.")
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("--max-steps must be at least 1 when provided.")
     if status_interval_seconds <= 0:
         raise ValueError("--status-interval-seconds must be greater than 0.")
     if log_tail_lines < 0:
@@ -2485,6 +2856,7 @@ def run_training(
     profile_overrides = profile_overrides or TrainingProfileOverrides()
     profile = _apply_training_profile_overrides(profile, profile_overrides)
     source_context_settings = (source_context_settings or SourceContextSettings()).normalized()
+    effective_max_steps = int(max_steps) if max_steps is not None else None
     distributed_context = _distributed_context(distributed_child)
     writes_metadata = distributed_context.is_rank_zero
     run_id = run_id_override or f"train-{uuid.uuid4().hex[:12]}"
@@ -2578,6 +2950,9 @@ def run_training(
         **corpus_help_counts,
         "runtime_capabilities": capabilities.to_dict(),
     }
+    if effective_max_steps is not None:
+        base_metrics["max_steps"] = effective_max_steps
+        base_metrics["effective_training_profile"]["max_steps"] = effective_max_steps
     if writes_metadata:
         _write_json_file(metrics_path, base_metrics)
         emit_status(
@@ -2613,6 +2988,7 @@ def run_training(
             log_tail_lines=log_tail_lines,
             artifact_format=artifact_format,
             source_context_settings=source_context_settings,
+            max_steps=effective_max_steps,
         )
         try:
             completed = subprocess.run(
@@ -2678,6 +3054,7 @@ def run_training(
             distributed_strategy=effective_distributed_strategy,
             artifact_format=artifact_format,
             source_context_settings=source_context_settings,
+            max_steps=effective_max_steps,
         )
         metrics = {
             **base_metrics,

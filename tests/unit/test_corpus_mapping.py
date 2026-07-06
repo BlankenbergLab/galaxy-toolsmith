@@ -49,6 +49,22 @@ repositories:
 """.strip(),
         encoding="utf-8",
     )
+    (tool_dir / "tool_data_table_conf.xml").write_text(
+        """
+<tables>
+  <table name="samtools_ref" comment_char="#">
+    <columns>value, label, path</columns>
+    <file path="tool-data/samtools_ref.loc" />
+  </table>
+</tables>
+""".strip(),
+        encoding="utf-8",
+    )
+    (tool_dir / "tool-data").mkdir()
+    (tool_dir / "tool-data" / "samtools_ref.loc.sample").write_text(
+        "hg38\tHuman hg38\t/path/to/hg38.fa\n",
+        encoding="utf-8",
+    )
     (tool_dir / "samtools_view.xml").write_text(
         """
 <tool id="samtools_view" name="samtools_view" version="1.0.0">
@@ -93,6 +109,13 @@ repositories:
     assert "view" in rec["subcommands"]
     assert rec["macro_expansion_status"] in {"expanded", "partial", "not_applicable"}
     assert Path(rec["expanded_xml_path"]).exists()
+    sidecars = {item["relative_path"]: item for item in rec["wrapper_sidecar_files"]}
+    assert sidecars["macros.xml"]["role"] == "macros"
+    assert sidecars["macros.xml"]["root_tag"] == "macros"
+    assert sidecars["tool_data_table_conf.xml"]["role"] == "tool_data_table_conf"
+    assert sidecars["tool_data_table_conf.xml"]["root_tag"] == "tables"
+    assert sidecars["tool-data/samtools_ref.loc.sample"]["role"] == "tool_data_loc_sample"
+    assert rec["wrapper_source_summary"]["sidecar_file_count"] == 3
 
     index_path = Path(result["index_path"])
     assert index_path.exists()

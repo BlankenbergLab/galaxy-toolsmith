@@ -89,6 +89,24 @@ non-quantized profile for full-parameter tuning. Full large-model training is
 intended mainly for multi-GPU CUDA hosts; MLX full mode is exposed but is not
 the recommended path for 24B+ Apple Silicon runs.
 
+For unattended long-context CUDA training, use the context ladder runner. It
+estimates source-context fit, probes high-to-low context settings with
+`--max-steps`, and then trains at the highest passing GPU-only rung:
+
+```bash
+scripts/gtsm_context_ladder_train.sh launch
+scripts/gtsm_context_ladder_train.sh status
+```
+
+By default it tries `128k` down through `2k`, prefers `all-raw` source context
+when it fits, and uses GPU-only `deepspeed-zero3`/`fsdp`. CPU offload is not
+enabled unless you explicitly set `DISTRIBUTED_STRATEGIES=deepspeed-zero3-offload,...`.
+If `nvidia-smi` query mode is unreliable on a host but the target devices are
+known, launch with explicit devices and disable only the idle preflight:
+`GPU_DEVICES=0,1,2,3 NUM_PROCESSES=4 GPU_PREFLIGHT=0`.
+`launch` prefers `tmux` when available so the run survives shell cleanup; set
+`LAUNCH_BACKEND=nohup` to force the simpler fallback.
+
 The Linux conda environment includes `apptainer`, `squashfuse`, and `libfuse3`.
 `apptainer` provides the Singularity-compatible container runtime, `squashfuse`
 mounts cached SIF images directly, and `libfuse3` provides the env-local
@@ -139,6 +157,85 @@ gtsm model-cache-info
 ```
 
 Set `HF_TOKEN` when available to avoid unauthenticated Hugging Face Hub rate limits; cached local weights are reused either way after the first successful download.
+
+For one-off generation, source code can be supplied as an extracted directory,
+a single text file, or a compressed archive/URL. Archives are cached under
+`.gtsm-cache/manual-sources/archives/` before source-context filtering:
+
+```bash
+gtsm generate-wrapper \
+  --provider ollama \
+  --model <ollama-model> \
+  --tool-name my_tool \
+  --help-text-file help.txt \
+  --source-archive https://example.org/my_tool-1.0.tar.gz \
+  --source-context-mode all-filtered \
+  --stream-output \
+  --raw-response-log output/my_tool.raw.log \
+  --generate-sidecars \
+  --output my_tool.xml
+```
+
+Generation can also discover runtime context automatically from Bioconda or
+Biocontainers. In Conda mode, GTSM creates or reuses a cached environment,
+probes top-level and detected subcommand help, resolves upstream source from
+Bioconda/conda-forge recipes, and then feeds that context to generation:
+
+```bash
+gtsm generate-suite \
+  --provider local \
+  --model-variant <local-variant> \
+  --tool-name minibwa \
+  --discovery-mode conda \
+  --discovery-package minibwa \
+  --discovery-command minibwa \
+  --source-context-mode snippets \
+  --source-context-max-chars 32000 \
+  --output-dir repo/suite_minibwa \
+  --stream-output
+```
+
+XML generation always treats the main output as the primary Galaxy `<tool>`
+wrapper. Companion files such as `macros.xml`, `tool_data_table_conf.xml`, and
+`.loc.sample` files are sidecars and are written separately when requested.
+Helper scripts from wrapper `configfiles` or related source are useful training
+context, but generation prefers direct tool commands when possible instead of
+inventing new helper scripts.
+
+Generated tools include a deterministic Galaxy Toolsmith GitHub citation by
+default; pass `--no-toolsmith-citation` to omit it. Human-readable tool names
+can contain spaces, while `--tool-id` controls the safe Galaxy id when the
+derived id is not desired. Unknown datatypes are scaffolded by default with
+review files next to standalone outputs or at the repository root; pass
+`--no-datatype-scaffold` to skip those files.
+
+Use `--repository-output-dir` to write a Tool Shed-style bundle with the tool
+XML, optional sidecars, `.shed.yml`, and `.gtsm` generation metadata:
+
+```bash
+gtsm generate-wrapper \
+  --provider ollama \
+  --model <ollama-model> \
+  --tool-name my_tool \
+  --help-text-file help.txt \
+  --repository-output-dir repo/my_tool \
+  --shed-owner iuc \
+  --shed-category "Sequence Analysis"
+```
+
+For packages that should become multiple focused wrappers, plan and generate a
+suite repository bundle:
+
+```bash
+gtsm plan-suite --tool-name samtools --help-text-file samtools.help.txt
+gtsm generate-suite \
+  --provider ollama \
+  --model <ollama-model> \
+  --tool-name samtools \
+  --help-text-file samtools.help.txt \
+  --output-dir repo/suite_samtools \
+  --shed-owner iuc
+```
 
 ## Optional server/client mode
 ```bash

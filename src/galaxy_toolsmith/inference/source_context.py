@@ -194,6 +194,16 @@ class _SourceFile:
     included_path: str = ""
 
 
+@dataclass(frozen=True)
+class _PreparedSourceContext:
+    settings: SourceContextSettings
+    metadata_mappings: tuple[Mapping[str, Any], ...]
+    wrapper_metadata: str
+    candidate_files: tuple[_SourceFile, ...]
+    scanned_files: int = 0
+    errors: tuple[str, ...] = ()
+
+
 def normalize_source_context_mode(mode: str | None) -> str:
     normalized = (mode or SOURCE_CONTEXT_MODE_NONE).strip().lower().replace("_", "-")
     if normalized not in SOURCE_CONTEXT_MODES:
@@ -228,6 +238,51 @@ def build_source_context_from_record(
     if settings.mode == SOURCE_CONTEXT_MODE_NONE:
         return _empty_result(settings)
 
+    prepared = _prepare_source_context_from_record(record, settings)
+    return _render_prepared_source_context(prepared, settings=settings)
+
+
+def build_source_context_variants_from_record(
+    record: Mapping[str, Any],
+    settings_list: Sequence[SourceContextSettings | None],
+) -> tuple[SourceContextResult, ...]:
+    """Build several source-context budgets while scanning each semantic mode once."""
+
+    normalized = [
+        (settings or SourceContextSettings()).normalized()
+        for settings in settings_list
+    ]
+    results: list[SourceContextResult | None] = [None] * len(normalized)
+    grouped_indexes: dict[tuple[str, str, str], list[int]] = {}
+    for index, settings in enumerate(normalized):
+        if settings.mode == SOURCE_CONTEXT_MODE_NONE:
+            results[index] = _empty_result(settings)
+            continue
+        key = (
+            settings.mode,
+            str(settings.source_root or ""),
+            str(settings.source_file or ""),
+        )
+        grouped_indexes.setdefault(key, []).append(index)
+
+    for indexes in grouped_indexes.values():
+        prepared = _prepare_source_context_from_record(record, normalized[indexes[0]])
+        block_cache: dict[str, tuple[str, str]] = {}
+        for index in indexes:
+            results[index] = _render_prepared_source_context(
+                prepared,
+                settings=normalized[index],
+                block_cache=block_cache,
+            )
+
+    return tuple(result or _empty_result(settings) for result, settings in zip(results, normalized))
+
+
+def _prepare_source_context_from_record(
+    record: Mapping[str, Any],
+    settings: SourceContextSettings,
+) -> _PreparedSourceContext:
+    settings = settings.normalized()
     mappings = _record_bioconda_sources(record)
     roots = _source_roots_from_record(
         mappings,
@@ -238,7 +293,7 @@ def build_source_context_from_record(
     if settings.source_root is not None:
         roots.append(settings.source_root)
     files = [settings.source_file] if settings.source_file is not None else []
-    return _build_source_context(
+    return _prepare_source_context(
         settings=settings,
         metadata_mappings=mappings,
         wrapper_metadata=wrapper_metadata,
@@ -360,20 +415,47 @@ def _wrapper_sources_from_record(record: Mapping[str, Any]) -> list[_SourceFile]
                 included_path=f"configfile:{name}",
             )
         )
+    for item in _record_sequence(record, "wrapper_sidecar_files"):
+        content = str(item.get("content", "") or "")
+        if not content.strip():
+            continue
+        relpath = str(item.get("relative_path") or item.get("path") or "sidecar").strip()
+        role = str(item.get("role", "") or "sidecar").strip()
+        root_tag = str(item.get("root_tag", "") or "").strip()
+        score = 940 + _score_path(relpath, keywords=())
+        if role == "macros":
+            score += 20
+        if role.startswith("tool_data"):
+            score += 15
+        sources.append(
+            _SourceFile(
+                path=None,
+                root=None,
+                relpath=relpath,
+                score=score,
+                label=f"Existing wrapper sidecar ({role}{', root=<' + root_tag + '>' if root_tag else ''})",
+                inline_text=content,
+                included_path=f"sidecar:{relpath}",
+            )
+        )
     return sources
 
 
 def _format_wrapper_source_metadata(record: Mapping[str, Any]) -> str:
     helper_files = _record_sequence(record, "wrapper_helper_files")
     configfiles = _record_sequence(record, "wrapper_configfiles")
+    sidecars = _record_sequence(record, "wrapper_sidecar_files")
     summary = record.get("wrapper_source_summary", {})
-    if not helper_files and not configfiles and not summary:
+    if not helper_files and not configfiles and not sidecars and not summary:
         return ""
     blocks = ["Wrapper source metadata:\n"]
     if isinstance(summary, Mapping):
         for key in (
             "helper_file_count",
             "configfile_count",
+            "sidecar_file_count",
+            "macro_sidecar_count",
+            "tool_data_sidecar_count",
             "truncated_configfile_count",
             "skipped_file_count",
         ):
@@ -420,6 +502,27 @@ def _format_wrapper_source_metadata(record: Mapping[str, Any]) -> str:
             if details:
                 blocks.append(f" {' '.join(details)}")
             blocks.append("\n")
+    for item in sidecars:
+        relpath = str(item.get("relative_path") or item.get("path") or "").strip()
+        if not relpath:
+            continue
+        role = str(item.get("role", "") or "sidecar").strip()
+        root_tag = str(item.get("root_tag", "") or "").strip()
+        truncated = item.get("content_truncated")
+        sha = str(item.get("sha256", "") or "").strip()
+        details = []
+        if role:
+            details.append(f"role={role}")
+        if root_tag:
+            details.append(f"root=<{root_tag}>")
+        if truncated in {True, False}:
+            details.append(f"content_truncated={str(truncated).lower()}")
+        if sha:
+            details.append(f"sha256={sha[:16]}")
+        blocks.append(f"- sidecar: {relpath}")
+        if details:
+            blocks.append(f" {' '.join(details)}")
+        blocks.append("\n")
     return "".join(blocks).rstrip() + "\n"
 
 
@@ -479,45 +582,39 @@ def _build_source_context(
     roots: Sequence[Path | None],
     files: Sequence[Path | None],
 ) -> SourceContextResult:
-    errors: list[str] = []
-    parts: list[str] = []
-    used = 0
-    truncated = False
-    included_paths: list[str] = []
-    included_files = 0
-    scanned_files = 0
+    prepared = _prepare_source_context(
+        settings=settings,
+        metadata_mappings=metadata_mappings,
+        wrapper_metadata=wrapper_metadata,
+        wrapper_sources=wrapper_sources,
+        roots=roots,
+        files=files,
+    )
+    return _render_prepared_source_context(prepared, settings=settings)
+
+
+def _prepare_source_context(
+    *,
+    settings: SourceContextSettings,
+    metadata_mappings: Sequence[Mapping[str, Any]],
+    wrapper_metadata: str,
+    wrapper_sources: Sequence[_SourceFile],
+    roots: Sequence[Path | None],
+    files: Sequence[Path | None],
+) -> _PreparedSourceContext:
+    settings = settings.normalized()
     keywords = _keywords_from_mappings(metadata_mappings)
 
-    metadata_text = _format_source_metadata(metadata_mappings)
-    if metadata_text:
-        used, truncated = _append_with_budget(
-            parts,
-            used,
-            metadata_text,
-            max_chars=settings.max_chars,
-            truncated=truncated,
-        )
-    if wrapper_metadata:
-        used, truncated = _append_with_budget(
-            parts,
-            used,
-            wrapper_metadata,
-            max_chars=settings.max_chars,
-            truncated=truncated,
-        )
-
     if settings.mode == SOURCE_CONTEXT_MODE_METADATA:
-        return SourceContextResult(
-            text="".join(parts).strip(),
-            mode=settings.mode,
-            max_chars=settings.max_chars,
-            max_files=settings.max_files,
-            metadata_sources=len(metadata_mappings),
-            included_chars=used,
-            truncated=truncated,
-            errors=tuple(errors),
+        return _PreparedSourceContext(
+            settings=settings,
+            metadata_mappings=tuple(metadata_mappings),
+            wrapper_metadata=wrapper_metadata,
+            candidate_files=(),
         )
 
+    errors: list[str] = []
+    scanned_files = 0
     candidate_files: list[_SourceFile] = list(wrapper_sources)
     for file_path in files:
         if file_path is None:
@@ -542,30 +639,74 @@ def _build_source_context(
 
     candidate_files = _dedupe_source_files(candidate_files)
     candidate_files.sort(key=lambda item: (-item.score, item.relpath.lower()))
+    return _PreparedSourceContext(
+        settings=settings,
+        metadata_mappings=tuple(metadata_mappings),
+        wrapper_metadata=wrapper_metadata,
+        candidate_files=tuple(candidate_files),
+        scanned_files=scanned_files,
+        errors=tuple(errors),
+    )
+
+
+def _render_prepared_source_context(
+    prepared: _PreparedSourceContext,
+    *,
+    settings: SourceContextSettings | None = None,
+    block_cache: dict[str, tuple[str, str]] | None = None,
+) -> SourceContextResult:
+    settings = (settings or prepared.settings).normalized()
+    errors: list[str] = list(prepared.errors)
+    parts: list[str] = []
+    used = 0
+    truncated = False
+    included_paths: list[str] = []
+    included_files = 0
+
+    metadata_text = _format_source_metadata(prepared.metadata_mappings)
+    if metadata_text:
+        used, truncated = _append_with_budget(
+            parts,
+            used,
+            metadata_text,
+            max_chars=settings.max_chars,
+            truncated=truncated,
+        )
+    if prepared.wrapper_metadata:
+        used, truncated = _append_with_budget(
+            parts,
+            used,
+            prepared.wrapper_metadata,
+            max_chars=settings.max_chars,
+            truncated=truncated,
+        )
+
+    if settings.mode == SOURCE_CONTEXT_MODE_METADATA:
+        return SourceContextResult(
+            text="".join(parts).strip(),
+            mode=settings.mode,
+            max_chars=settings.max_chars,
+            max_files=settings.max_files,
+            metadata_sources=len(prepared.metadata_mappings),
+            included_chars=used,
+            truncated=truncated,
+            errors=tuple(errors),
+        )
+
     if settings.max_files:
-        selected_files = candidate_files[: settings.max_files]
-        if len(candidate_files) > len(selected_files):
+        selected_files = prepared.candidate_files[: settings.max_files]
+        if len(prepared.candidate_files) > len(selected_files):
             truncated = True
     else:
         selected_files = []
-        if candidate_files:
+        if prepared.candidate_files:
             truncated = True
 
     for source_file in selected_files:
-        if source_file.inline_text is not None:
-            text = source_file.inline_text
-        elif source_file.path is not None:
-            text, file_error = _read_source_file(source_file.path)
-            if file_error:
-                errors.append(file_error)
-                continue
-        else:
+        block, file_error = _source_file_block(source_file, block_cache=block_cache)
+        if file_error:
+            errors.append(file_error)
             continue
-        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-        block = (
-            f"\n{source_file.label}: {source_file.relpath}\n"
-            f"sha256: {digest}\n```\n{text.rstrip()}\n```\n"
-        )
         previous_used = used
         used, truncated = _append_with_budget(
             parts,
@@ -585,14 +726,57 @@ def _build_source_context(
         mode=settings.mode,
         max_chars=settings.max_chars,
         max_files=settings.max_files,
-        metadata_sources=len(metadata_mappings),
-        scanned_files=scanned_files,
+        metadata_sources=len(prepared.metadata_mappings),
+        scanned_files=prepared.scanned_files,
         included_files=included_files,
         included_chars=used,
         truncated=truncated,
         included_paths=tuple(included_paths),
         errors=tuple(errors[:10]),
     )
+
+
+def _source_file_cache_key(source_file: _SourceFile) -> str:
+    if source_file.inline_text is not None:
+        digest = hashlib.sha256(source_file.inline_text.encode("utf-8", errors="replace")).hexdigest()
+        return f"inline:{source_file.label}:{source_file.relpath}:{digest}"
+    if source_file.path is not None:
+        try:
+            return str(source_file.path.resolve())
+        except OSError:
+            return str(source_file.path)
+    return f"unknown:{source_file.label}:{source_file.relpath}"
+
+
+def _source_file_block(
+    source_file: _SourceFile,
+    *,
+    block_cache: dict[str, tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    cache_key = _source_file_cache_key(source_file)
+    if block_cache is not None and cache_key in block_cache:
+        return block_cache[cache_key]
+    if source_file.inline_text is not None:
+        text = source_file.inline_text
+        file_error = ""
+    elif source_file.path is not None:
+        text, file_error = _read_source_file(source_file.path)
+    else:
+        text, file_error = "", ""
+    if file_error:
+        result = ("", file_error)
+    else:
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        result = (
+            (
+                f"\n{source_file.label}: {source_file.relpath}\n"
+                f"sha256: {digest}\n```\n{text.rstrip()}\n```\n"
+            ),
+            "",
+        )
+    if block_cache is not None:
+        block_cache[cache_key] = result
+    return result
 
 
 def _append_with_budget(
@@ -610,14 +794,35 @@ def _append_with_budget(
         return used + len(text), truncated
     remaining = max_chars - used
     if remaining > 0:
-        marker = "\n[truncated source context]\n"
-        if remaining > len(marker):
-            chunk = text[: remaining - len(marker)].rstrip() + marker
-        else:
-            chunk = text[:remaining]
+        chunk = _truncate_source_context_chunk(text, remaining)
         parts.append(chunk)
         used += len(chunk)
     return used, True
+
+
+def _truncate_source_context_chunk(text: str, max_chars: int) -> str:
+    marker = "\n[truncated source context]\n"
+    closing_fence = "\n```\n"
+    if max_chars <= 0:
+        return ""
+    if max_chars <= len(marker):
+        return text[:max_chars]
+
+    chunk_budget = max_chars - len(marker)
+    chunk = text[:chunk_budget].rstrip()
+    if _has_open_markdown_fence(chunk):
+        chunk_budget = max_chars - len(marker) - len(closing_fence)
+        if chunk_budget > 0:
+            chunk = text[:chunk_budget].rstrip()
+            if _has_open_markdown_fence(chunk):
+                return chunk + closing_fence + marker
+            return chunk + marker
+        return text[: max(0, max_chars - len(marker))].rstrip() + marker
+    return chunk + marker
+
+
+def _has_open_markdown_fence(text: str) -> bool:
+    return text.count("```") % 2 == 1
 
 
 def _format_source_metadata(mappings: Sequence[Mapping[str, Any]]) -> str:
@@ -741,8 +946,7 @@ def _scan_source_root(
             continue
         relpath = rel.as_posix()
         score = _score_path(relpath, keywords=keywords)
-        if mode == SOURCE_CONTEXT_MODE_SNIPPETS:
-            score += _score_file_sample(path)
+        score += _score_file_sample(path)
         candidates.append(_SourceFile(path=path, root=resolved_root, relpath=relpath, score=score))
     return scanned, candidates, errors
 
@@ -824,15 +1028,28 @@ def _score_path(relpath: str, *, keywords: Sequence[str]) -> int:
     rel_lower = relpath.lower()
     basename = Path(relpath).name.lower()
     score = 0
+    if rel_lower.startswith(".github/workflows/") or "/.github/workflows/" in f"/{rel_lower}":
+        score -= 120
     if (
         "/bin/" in f"/{rel_lower}"
         or "/scripts/" in f"/{rel_lower}"
         or "/script/" in f"/{rel_lower}"
     ):
         score += 80
+    if basename.startswith("readme"):
+        score += 55
     if basename in {"setup.py", "setup.cfg", "pyproject.toml"}:
         score += 70
-    if basename in {"cli.py", "commands.py", "command.py", "__main__.py", "main.py"}:
+    if basename in {
+        "cli.py",
+        "commands.py",
+        "command.py",
+        "__main__.py",
+        "main.py",
+        "main.c",
+        "main.cc",
+        "main.cpp",
+    } or basename.endswith(("-main.c", "-main.cc", "-main.cpp")):
         score += 60
     normalized_path = _keyword(relpath)
     for keyword in keywords:
@@ -850,4 +1067,10 @@ def _score_file_sample(path: Path) -> int:
     for pattern in CLI_PATTERNS:
         if pattern in sample:
             score += 35
+    lowered = sample.lower()
+    if "usage:" in lowered or "getting started" in lowered:
+        score += 30
+    for marker in ("getopt", "ketopt", "argv", "argc", "subcommand"):
+        if marker in lowered:
+            score += 20
     return score

@@ -43,6 +43,9 @@ def test_default_xml_generate_prompt_renders_required_fields() -> None:
     assert "behavior context to understand the command line" in rendered
     assert "Prefer direct <command> logic" in rendered
     assert "script-like configfiles only as a last resort" in rendered
+    assert "Final response contract:" in rendered
+    assert "Do not return C, Python, R, shell, YAML" in rendered
+    assert rendered.rfind("Final response contract:") > rendered.rfind("int main() { return 0; }")
 
 
 def test_default_udt_yaml_generate_prompt_renders_required_fields() -> None:

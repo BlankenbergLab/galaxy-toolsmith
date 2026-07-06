@@ -5,6 +5,7 @@ from pathlib import Path
 from galaxy_toolsmith.inference.source_context import (
     build_source_context_from_paths,
     build_source_context_from_record,
+    build_source_context_variants_from_record,
     source_context_settings,
 )
 
@@ -249,6 +250,21 @@ def test_source_context_marks_truncated_wrapper_configfiles(tmp_path: Path) -> N
     assert "[truncated configfile content]" in result.text
 
 
+def test_truncated_source_context_closes_markdown_fence(tmp_path: Path) -> None:
+    source_file = tmp_path / "tool.py"
+    source_file.write_text("def main():\n" + "    print('x')\n" * 100, encoding="utf-8")
+
+    result = build_source_context_from_paths(
+        settings=source_context_settings(mode="snippets", max_chars=180, max_files=1),
+        source_file=source_file,
+    )
+
+    assert result.truncated is True
+    assert "[truncated source context]" in result.text
+    assert result.text.count("```") % 2 == 0
+    assert result.text.rfind("```") < result.text.rfind("[truncated source context]")
+
+
 def test_all_filtered_excludes_tests_while_all_raw_can_include_them(tmp_path: Path) -> None:
     root = _source_tree(tmp_path)
     filtered = build_source_context_from_record(
@@ -263,6 +279,22 @@ def test_all_filtered_excludes_tests_while_all_raw_can_include_them(tmp_path: Pa
     assert "tests/test_cli.py" not in filtered.text
     assert "Source file: tests/test_cli.py" in raw.text
     assert "reads.fastq" not in raw.text
+
+
+def test_source_context_variants_match_individual_builds(tmp_path: Path) -> None:
+    root = _source_tree(tmp_path)
+    record = _record(root)
+    settings = [
+        source_context_settings(mode="all-filtered", max_chars=3000, max_files=1),
+        source_context_settings(mode="all-filtered", max_chars=8000, max_files=10),
+        source_context_settings(mode="all-raw", max_chars=8000, max_files=10),
+    ]
+
+    variants = build_source_context_variants_from_record(record, settings)
+
+    assert variants == tuple(
+        build_source_context_from_record(record, setting) for setting in settings
+    )
 
 
 def test_all_filtered_skips_weak_source_roots_but_keeps_metadata(tmp_path: Path) -> None:

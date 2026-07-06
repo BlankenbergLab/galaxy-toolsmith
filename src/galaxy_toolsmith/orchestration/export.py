@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from pathlib import Path
 
 from galaxy_toolsmith.core.paths import WorkspacePaths
@@ -14,6 +16,24 @@ from galaxy_toolsmith.runtime.model_source import (
     model_source_load_kwargs,
     resolve_model_source_policy,
 )
+
+OLLAMA_MODEL_NAME_MAX_LENGTH = 64
+_OLLAMA_MODEL_NAME_HASH_LENGTH = 10
+_OLLAMA_MODEL_NAME_SAFE_CHARS = re.compile(r"[^a-z0-9._:-]+")
+_OLLAMA_MODEL_NAME_SEPARATORS = re.compile(r"[-_.:]{2,}")
+_OLLAMA_RAW_TEMPLATE = "{{ .Prompt }}"
+_OLLAMA_MISTRAL_TEMPLATE = (
+    "{{ if .System }}[INST] {{ .System }}\n\n{{ .Prompt }} [/INST]"
+    "{{ else }}[INST] {{ .Prompt }} [/INST]{{ end }}"
+)
+_OLLAMA_TEMPLATE_STYLES = {"auto", "raw", "mistral"}
+
+
+@dataclass(frozen=True)
+class OllamaModelName:
+    requested: str
+    effective: str
+    changed: bool
 
 
 @dataclass(frozen=True)
@@ -30,6 +50,7 @@ class ExportResult:
     model_source_policy: dict = field(default_factory=dict)
     ollama_modelfile_path: str = ""
     ollama_model_name: str = ""
+    requested_ollama_model_name: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -52,16 +73,42 @@ def update_variant_ollama_metadata(
     *,
     ollama_model_name: str,
     ollama_modelfile_path: str,
+    requested_ollama_model_name: str = "",
     export_quantizations: list[str] | None = None,
 ) -> Path:
     path = _variant_manifest_path(paths, variant_id)
     variant = _load_variant(paths, variant_id)
     variant["ollama_model_name"] = ollama_model_name
     variant["ollama_modelfile_path"] = ollama_modelfile_path
+    if requested_ollama_model_name and requested_ollama_model_name != ollama_model_name:
+        variant["requested_ollama_model_name"] = requested_ollama_model_name
+    else:
+        variant.pop("requested_ollama_model_name", None)
     if export_quantizations:
         variant["export_quantizations"] = list(export_quantizations)
     path.write_text(json.dumps(variant, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def normalize_ollama_model_name(model_name: str) -> OllamaModelName:
+    requested = str(model_name or "").strip()
+    hash_source = requested or "gtsm-model"
+    digest = sha256(hash_source.encode("utf-8")).hexdigest()[:_OLLAMA_MODEL_NAME_HASH_LENGTH]
+    effective = requested.lower()
+    effective = "".join("-" if ord(char) < 32 or ord(char) == 127 else char for char in effective)
+    effective = _OLLAMA_MODEL_NAME_SAFE_CHARS.sub("-", effective)
+    effective = _OLLAMA_MODEL_NAME_SEPARATORS.sub("-", effective).strip("-_.:")
+    if not effective:
+        effective = f"gtsm-model-{digest}"
+    if len(effective) > OLLAMA_MODEL_NAME_MAX_LENGTH:
+        suffix = f"-{digest}"
+        prefix_length = OLLAMA_MODEL_NAME_MAX_LENGTH - len(suffix)
+        effective = effective[:prefix_length].rstrip("-_.:") + suffix
+    return OllamaModelName(
+        requested=requested,
+        effective=effective,
+        changed=effective != requested,
+    )
 
 
 def _is_peft_adapter(artifact_dir: Path, variant: dict | None = None) -> bool:
@@ -215,6 +262,28 @@ def _ollama_from_path(gguf_path: str) -> str:
             "artifact to a path without spaces before generating the Modelfile."
         )
     return path
+
+
+def _ollama_template_style_for_variant(variant: dict) -> str:
+    configured = os.getenv("GTSM_OLLAMA_TEMPLATE_STYLE", "auto").strip().lower() or "auto"
+    if configured not in _OLLAMA_TEMPLATE_STYLES:
+        configured = "auto"
+    if configured != "auto":
+        return configured
+
+    model_text = " ".join(
+        str(variant.get(key, "") or "")
+        for key in ("profile_name", "profile", "base_model")
+    ).lower()
+    if "mistral" in model_text or "devstral" in model_text:
+        return "mistral"
+    return "raw"
+
+
+def _ollama_template_for_style(style: str) -> str:
+    if style == "mistral":
+        return _OLLAMA_MISTRAL_TEMPLATE
+    return _OLLAMA_RAW_TEMPLATE
 
 
 def _export_gguf_with_llama_cpp(
@@ -462,21 +531,40 @@ def write_ollama_modelfile(
             quantizations=[from_quantization],
         )
     data = json.loads(export_result_path.read_text(encoding="utf-8"))
+    try:
+        variant = _load_variant(paths, variant_id)
+    except FileNotFoundError:
+        variant = {}
+    normalized_name = normalize_ollama_model_name(model_name)
     gguf_paths = dict(data.get("gguf_paths", {}))
     gguf_path = _ollama_from_path(
         str(gguf_paths.get(from_quantization, "")).strip() or str(data.get("gguf_path", "")).strip()
     )
+    template_style = _ollama_template_style_for_variant(variant)
+    template = _ollama_template_for_style(template_style)
     modelfile_dir = export_root / "ollama"
     modelfile_dir.mkdir(parents=True, exist_ok=True)
     modelfile_path = modelfile_dir / "Modelfile"
     content = (
         f"FROM {gguf_path}\n"
-        "TEMPLATE \"\"\"\n{{ .Prompt }}\n\"\"\"\n"
-        "PARAMETER stop \"</tool>\"\n"
+        f"TEMPLATE \"\"\"\n{template}\n\"\"\"\n"
     )
     modelfile_path.write_text(content, encoding="utf-8")
     data["ollama_modelfile_path"] = str(modelfile_path)
-    data["ollama_model_name"] = model_name
+    data["ollama_model_name"] = normalized_name.effective
+    data["ollama_template_style"] = template_style
+    if normalized_name.changed:
+        data["requested_ollama_model_name"] = normalized_name.requested
+        notes = list(data.get("notes", []))
+        note = (
+            "Ollama model name normalized from "
+            f"{normalized_name.requested!r} to {normalized_name.effective!r}."
+        )
+        if note not in notes:
+            notes.append(note)
+        data["notes"] = notes
+    else:
+        data.pop("requested_ollama_model_name", None)
     export_result_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     return modelfile_path
 
@@ -489,18 +577,22 @@ def _ollama_cli() -> str:
 
 
 def create_ollama_model(modelfile_path: Path, model_name: str) -> dict:
+    normalized_name = normalize_ollama_model_name(model_name)
     completed = subprocess.run(
-        [_ollama_cli(), "create", model_name, "-f", str(modelfile_path)],
+        [_ollama_cli(), "create", normalized_name.effective, "-f", str(modelfile_path)],
         check=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         capture_output=True,
     )
-    return {
-        "model_name": model_name,
+    payload = {
+        "model_name": normalized_name.effective,
         "modelfile_path": str(modelfile_path),
         "stdout": completed.stdout.strip(),
         "stderr": completed.stderr.strip(),
         "returncode": completed.returncode,
     }
+    if normalized_name.changed:
+        payload["requested_ollama_model_name"] = normalized_name.requested
+    return payload
