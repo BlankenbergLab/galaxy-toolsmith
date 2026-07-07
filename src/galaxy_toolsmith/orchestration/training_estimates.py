@@ -30,11 +30,13 @@ from galaxy_toolsmith.inference.source_context import (
 from galaxy_toolsmith.models.training import TrainingProfile
 from galaxy_toolsmith.orchestration.training import (
     _append_conversion_training_sample,
+    _append_repair_training_sample,
     _append_training_sample,
     _record_training_sidecar_context,
     _resolve_training_udt_target,
     _resolve_training_xml_target,
     _training_data_diagnostics,
+    _update_training_quality_diagnostics,
     _update_source_context_diagnostics,
 )
 
@@ -62,6 +64,9 @@ _DIAGNOSTIC_EXAMPLE_KEYS = (
     "skipped_non_tool_xml_target_examples",
     "missing_udt_target_examples",
     "empty_udt_target_examples",
+    "help_only_command_examples",
+    "optional_only_input_examples",
+    "missing_effective_help_examples",
 )
 
 
@@ -143,6 +148,8 @@ def _training_text(record: dict[str, str]) -> str:
 def _classify_training_sample(record: dict[str, str]) -> str:
     instruction = str(record.get("instruction", "")).lstrip()
     output = str(record.get("output", "")).lstrip()
+    if instruction.startswith("Repair the following generated Galaxy tool XML"):
+        return "xml_repair"
     if instruction.startswith("Convert the following Galaxy User-Defined Tool YAML"):
         return "udt_to_xml"
     if output.startswith("<tool"):
@@ -242,6 +249,10 @@ def _source_settings_for_case(
         max_files=max_files,
         source_root=base_settings.source_root,
         source_file=base_settings.source_file,
+        test_context_mode=base_settings.test_context_mode,
+        test_context_max_chars=base_settings.test_context_max_chars,
+        test_context_max_files=base_settings.test_context_max_files,
+        test_context_max_file_bytes=base_settings.test_context_max_file_bytes,
     )
 
 
@@ -263,6 +274,10 @@ def _case_key(settings: SourceContextSettings) -> tuple[Any, ...]:
         settings.max_files,
         str(settings.source_root or ""),
         str(settings.source_file or ""),
+        settings.test_context_mode,
+        settings.test_context_max_chars,
+        settings.test_context_max_files,
+        settings.test_context_max_file_bytes,
     )
 
 
@@ -304,12 +319,13 @@ def _new_case_diagnostics(
     diagnostics = _training_data_diagnostics()
     diagnostics["artifact_format"] = artifact_format
     diagnostics["source_context_mode"] = settings.mode
+    diagnostics["test_context_mode"] = settings.test_context_mode
     return diagnostics
 
 
 def _merge_diagnostics(target: dict[str, Any], source: Mapping[str, Any]) -> None:
     for key, value in source.items():
-        if key in {"artifact_format", "source_context_mode"}:
+        if key in {"artifact_format", "source_context_mode", "test_context_mode"}:
             continue
         if key == "target_source_counts" and isinstance(value, Mapping):
             counts = target.setdefault("target_source_counts", {})
@@ -348,6 +364,8 @@ def _sample_metadata(
     source_code: str,
     included_source_files: int,
     source_truncated: bool,
+    included_test_files: int = 0,
+    test_context_truncated: bool = False,
 ) -> dict[str, Any]:
     requirement_packages = record.get("requirement_packages", [])
     requirement_versions = record.get("requirement_versions", [])
@@ -378,6 +396,8 @@ def _sample_metadata(
         "source_context_chars": len(source_code),
         "source_context_files": included_source_files,
         "source_context_truncated": source_truncated,
+        "test_context_files": included_test_files,
+        "test_context_truncated": test_context_truncated,
     }
 
 
@@ -452,6 +472,7 @@ def _process_estimate_record(
             repo_root=repo_root,
             diagnostics=target_diagnostics,
         )
+    _update_training_quality_diagnostics(target_diagnostics, record, xml_target=xml_target)
 
     has_trainable_target = (
         artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
@@ -480,16 +501,20 @@ def _process_estimate_record(
         if has_trainable_target:
             source_context = source_context_results[index]
             _update_source_context_diagnostics(diagnostics, source_context)
-            if case.settings.mode != "none":
+            if source_context.text.strip():
                 source_code = source_context.text
             sidecar_context = _record_training_sidecar_context(record)
             if sidecar_context:
                 source_code = "\n\n".join(part for part in (source_code, sidecar_context) if part)
             included_source_files = source_context.included_files
             source_truncated = source_context.truncated
+            included_test_files = source_context.included_test_files
+            test_context_truncated = source_context.test_context_truncated
         else:
             included_source_files = 0
             source_truncated = False
+            included_test_files = 0
+            test_context_truncated = False
 
         records: list[dict[str, str]] = []
         if (
@@ -506,6 +531,15 @@ def _process_estimate_record(
                 record=record,
                 tool_name=tool_name,
                 output=xml_target,
+                source_code=source_code,
+            )
+            _append_repair_training_sample(
+                records,
+                diagnostics=diagnostics,
+                profile=profile,
+                record=record,
+                tool_name=tool_name,
+                xml_target=xml_target,
                 source_code=source_code,
             )
         if (
@@ -559,6 +593,8 @@ def _process_estimate_record(
                 source_code=source_code,
                 included_source_files=included_source_files,
                 source_truncated=source_truncated,
+                included_test_files=included_test_files,
+                test_context_truncated=test_context_truncated,
             )
             for training_record, text, token_length in zip(
                 records,

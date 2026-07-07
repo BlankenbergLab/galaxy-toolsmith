@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -47,6 +49,16 @@ from galaxy_toolsmith.runtime.status import emit_status
 def _load_dataset_id(dataset_manifest_path: Path) -> str:
     dataset = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
     return str(dataset.get("dataset_id", "unknown-dataset"))
+
+
+def _file_sha256(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _corpus_container_help_counts(corpus_jsonl_path: Path) -> dict[str, int]:
@@ -839,15 +851,30 @@ def _training_data_diagnostics() -> dict[str, Any]:
         "source_context_files": 0,
         "source_context_truncated_records": 0,
         "source_context_error_records": 0,
+        "test_context_mode": "none",
+        "test_context_records": 0,
+        "test_context_chars": 0,
+        "test_context_files": 0,
+        "test_context_truncated_records": 0,
         "records_with_shed_metadata": 0,
         "records_with_suite_metadata": 0,
         "records_with_repository_sidecars": 0,
         "skipped_non_primary_repository_metadata_targets": 0,
+        "records_with_runtime_help": 0,
+        "records_with_degraded_help": 0,
+        "records_with_missing_effective_help": 0,
+        "records_with_help_only_command": 0,
+        "records_with_optional_only_inputs": 0,
+        "records_with_repair_feedback": 0,
+        "repair_training_samples": 0,
         "missing_xml_target_examples": [],
         "empty_xml_target_examples": [],
         "skipped_non_tool_xml_target_examples": [],
         "missing_udt_target_examples": [],
         "empty_udt_target_examples": [],
+        "help_only_command_examples": [],
+        "optional_only_input_examples": [],
+        "missing_effective_help_examples": [],
     }
 
 
@@ -1014,11 +1041,203 @@ def _append_training_sample(
     )
 
 
+def _xml_command_text(xml_target: str) -> str:
+    try:
+        root = ET.fromstring(xml_target)
+    except ET.ParseError:
+        return ""
+    command = root.find("command")
+    if command is None:
+        return ""
+    return " ".join(part.strip() for part in command.itertext() if part and part.strip())
+
+
+_HELP_TOKEN_RE = re.compile(r"(?<![\w-])(?:--help|-h|help)(?![\w-])", re.I)
+
+
+def _xml_command_looks_help_only(xml_target: str) -> bool:
+    command = _xml_command_text(xml_target)
+    if not command or not _HELP_TOKEN_RE.search(command):
+        return False
+    lowered = command.lower()
+    if re.search(r"\$|\binput\b|\boutput\b|>\s*\S|<\s*\S", lowered):
+        return False
+    tokens = re.findall(r"[A-Za-z0-9_./:+-]+", command)
+    return len(tokens) <= 6
+
+
+def _xml_inputs_are_optional_only(xml_target: str) -> bool:
+    try:
+        root = ET.fromstring(xml_target)
+    except ET.ParseError:
+        return False
+    params = [
+        param
+        for param in root.findall(".//inputs//param")
+        if str(param.get("type", "")).strip().lower() != "hidden"
+    ]
+    if not params:
+        return False
+    for param in params:
+        optional = str(param.get("optional", "")).strip().lower()
+        if optional not in {"true", "1", "yes"}:
+            return False
+    return True
+
+
+def _record_has_runtime_help(record: dict) -> bool:
+    if str(record.get("container_help_text", "")).strip():
+        return True
+    if str(record.get("container_usage_text", "")).strip():
+        return True
+    for event in record.get("container_execution", []) or []:
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("status", "") or "")
+        if status.startswith("container-command-help") or status.startswith(
+            "container-command-usage"
+        ):
+            return True
+    return False
+
+
+def _record_has_degraded_help(record: dict) -> bool:
+    for event in record.get("container_execution", []) or []:
+        if isinstance(event, dict) and "degraded" in str(event.get("status", "") or ""):
+            return True
+    return False
+
+
+def _update_training_quality_diagnostics(
+    diagnostics: dict[str, Any],
+    record: dict,
+    *,
+    xml_target: str = "",
+) -> None:
+    tool_name = str(record.get("tool_name", "")).strip()
+    if _record_has_runtime_help(record):
+        diagnostics["records_with_runtime_help"] += 1
+    if _record_has_degraded_help(record):
+        diagnostics["records_with_degraded_help"] += 1
+    if not _record_training_help_text(record).strip():
+        diagnostics["records_with_missing_effective_help"] += 1
+        _add_limited_example(
+            diagnostics,
+            "missing_effective_help_examples",
+            {"tool_name": tool_name},
+        )
+    if xml_target and _xml_command_looks_help_only(xml_target):
+        diagnostics["records_with_help_only_command"] += 1
+        _add_limited_example(
+            diagnostics,
+            "help_only_command_examples",
+            {
+                "tool_name": tool_name,
+                "command": _xml_command_text(xml_target)[:500],
+            },
+        )
+    if xml_target and _xml_inputs_are_optional_only(xml_target):
+        diagnostics["records_with_optional_only_inputs"] += 1
+        _add_limited_example(
+            diagnostics,
+            "optional_only_input_examples",
+            {"tool_name": tool_name},
+        )
+
+
+def _repair_feedback_items(record: dict) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for key in (
+        "repair_feedback",
+        "generation_repair_feedback",
+        "wrapper_repair_feedback",
+        "failed_generation_feedback",
+    ):
+        raw_value = record.get(key, [])
+        raw_items = raw_value if isinstance(raw_value, list) else [raw_value]
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            generated = str(
+                raw_item.get("generated_xml")
+                or raw_item.get("invalid_xml")
+                or raw_item.get("candidate_xml")
+                or raw_item.get("raw_output")
+                or raw_item.get("raw_response")
+                or ""
+            ).strip()
+            feedback = str(
+                raw_item.get("feedback")
+                or raw_item.get("validation_feedback")
+                or raw_item.get("validation_errors")
+                or raw_item.get("repair_reason")
+                or raw_item.get("error")
+                or ""
+            ).strip()
+            if generated and feedback:
+                items.append({"generated": generated[:12000], "feedback": feedback[:4000]})
+    return items
+
+
+def _append_repair_training_sample(
+    records: list[dict[str, str]],
+    *,
+    diagnostics: dict[str, Any],
+    profile: TrainingProfile,
+    record: dict,
+    tool_name: str,
+    xml_target: str,
+    source_code: str = "",
+) -> None:
+    feedback_items = _repair_feedback_items(record)
+    if not feedback_items:
+        return
+    diagnostics["records_with_repair_feedback"] += 1
+    target_source_counts = diagnostics.setdefault("target_source_counts", {})
+    source_key = "xml_repair:feedback"
+    item = feedback_items[0]
+    target_source_counts[source_key] = int(target_source_counts.get(source_key, 0)) + 1
+    context_parts = [
+        "Repair the following generated Galaxy tool XML using the validation feedback, "
+        "tool help, and any source context. Return exactly one corrected <tool> document.",
+        f"Tool name: {tool_name}",
+        f"Skills profile: {profile.skills_profile}",
+    ]
+    help_text = _record_training_help_text(record)
+    if help_text:
+        context_parts.extend(["Tool help:", help_text])
+    if source_code:
+        context_parts.extend(["Source and sidecar context:", source_code])
+    context_parts.extend(
+        [
+            "Validation feedback:",
+            item["feedback"],
+            "Generated XML to repair:",
+            item["generated"],
+        ]
+    )
+    records.append(
+        {
+            "instruction": "\n\n".join(context_parts),
+            "input": "",
+            "output": xml_target,
+        }
+    )
+    diagnostics["repair_training_samples"] += 1
+
+
 def _update_source_context_diagnostics(
     diagnostics: dict[str, Any],
     source_context: SourceContextResult,
 ) -> None:
     diagnostics["source_context_mode"] = source_context.mode
+    diagnostics["test_context_mode"] = source_context.test_context_mode
+    if source_context.included_test_files or source_context.included_test_chars:
+        diagnostics["test_context_records"] += 1
+        diagnostics["test_context_chars"] += source_context.included_test_chars
+        diagnostics["test_context_files"] += source_context.included_test_files
+        if source_context.test_context_truncated:
+            diagnostics["test_context_truncated_records"] += 1
     if not source_context.text.strip():
         if source_context.errors:
             diagnostics["source_context_error_records"] += 1
@@ -1076,7 +1295,7 @@ def _merge_training_data_diagnostics(
                 remaining = max(0, 10 - len(target_examples))
                 target_examples.extend(value[:remaining])
             continue
-        if key in {"artifact_format", "source_context_mode"}:
+        if key in {"artifact_format", "source_context_mode", "test_context_mode"}:
             target[key] = value
             continue
         if isinstance(value, int):
@@ -1099,6 +1318,7 @@ def _training_samples_from_record(
     diagnostics["total_corpus_records"] = 1
     diagnostics["artifact_format"] = artifact_format
     diagnostics["source_context_mode"] = source_context_settings.mode
+    diagnostics["test_context_mode"] = source_context_settings.test_context_mode
     tool_name = str(record.get("tool_name", "")).strip()
     if not tool_name:
         diagnostics["missing_tool_name_count"] += 1
@@ -1139,6 +1359,7 @@ def _training_samples_from_record(
             repo_root=repo_root,
             diagnostics=diagnostics,
         )
+    _update_training_quality_diagnostics(diagnostics, record, xml_target=xml_target)
 
     has_trainable_target = (
         artifact_format in {ARTIFACT_FORMAT_XML, TRAINING_ARTIFACT_FORMAT_MIXED}
@@ -1153,7 +1374,7 @@ def _training_samples_from_record(
     if has_trainable_target:
         source_context = build_source_context_from_record(record, source_context_settings)
         _update_source_context_diagnostics(diagnostics, source_context)
-        if source_context_settings.mode != "none":
+        if source_context.text.strip():
             source_code = source_context.text
         sidecar_context = _record_training_sidecar_context(record)
         if sidecar_context:
@@ -1173,6 +1394,15 @@ def _training_samples_from_record(
             record=record,
             tool_name=tool_name,
             output=xml_target,
+            source_code=source_code,
+        )
+        _append_repair_training_sample(
+            records,
+            diagnostics=diagnostics,
+            profile=profile,
+            record=record,
+            tool_name=tool_name,
+            xml_target=xml_target,
             source_code=source_code,
         )
     if (
@@ -1232,6 +1462,7 @@ def _load_instruction_records_with_diagnostics(
     diagnostics = _training_data_diagnostics()
     diagnostics["artifact_format"] = artifact_format
     diagnostics["source_context_mode"] = source_context_settings.mode
+    diagnostics["test_context_mode"] = source_context_settings.test_context_mode
     parsed_records: list[dict[str, Any]] = []
     seen_corpus_records = 0
     with corpus_jsonl_path.open("r", encoding="utf-8") as handle:
@@ -2813,6 +3044,20 @@ def _hf_sft_distributed_launch_command(
             command.extend(["--source-root", str(source_context_settings.source_root)])
         if source_context_settings.source_file is not None:
             command.extend(["--source-file", str(source_context_settings.source_file)])
+    if source_context_settings.test_context_mode != "none":
+        command.extend(["--test-context-mode", source_context_settings.test_context_mode])
+        command.extend(
+            ["--test-context-max-chars", str(source_context_settings.test_context_max_chars)]
+        )
+        command.extend(
+            ["--test-context-max-files", str(source_context_settings.test_context_max_files)]
+        )
+        command.extend(
+            [
+                "--test-context-max-file-bytes",
+                str(source_context_settings.test_context_max_file_bytes),
+            ]
+        )
     if status_log_path is not None:
         command.extend(["--status-log", str(status_log_path)])
     command.extend(["--status-interval-seconds", str(status_interval_seconds)])
@@ -2935,6 +3180,15 @@ def run_training(
         "artifact_kind": artifact_kind,
         "artifact_format": artifact_format,
         "source_context": source_context_settings.to_dict(),
+        "training_data_manifest": {
+            "schema_version": 1,
+            "dataset_manifest_path": str(dataset_manifest_path),
+            "dataset_manifest_sha256": _file_sha256(dataset_manifest_path),
+            "corpus_jsonl_path": str(corpus_path),
+            "corpus_jsonl_sha256": _file_sha256(corpus_path),
+            "artifact_format": artifact_format,
+            "source_context": source_context_settings.to_dict(),
+        },
         "requested_distributed_strategy": distributed_strategy or profile.distributed_strategy,
         "distributed_strategy": effective_distributed_strategy,
         "training_profile_overrides": profile_overrides.to_dict(),

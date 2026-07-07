@@ -71,7 +71,11 @@ from galaxy_toolsmith.inference.source_archives import (
 from galaxy_toolsmith.inference.source_context import (
     DEFAULT_SOURCE_CONTEXT_MAX_CHARS,
     DEFAULT_SOURCE_CONTEXT_MAX_FILES,
+    DEFAULT_TEST_CONTEXT_MAX_CHARS,
+    DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES,
+    DEFAULT_TEST_CONTEXT_MAX_FILES,
     SOURCE_CONTEXT_MODES,
+    TEST_CONTEXT_MODES,
     source_context_settings,
 )
 from galaxy_toolsmith.inference.suite import (
@@ -257,6 +261,41 @@ def _add_source_context_args(
         default=DEFAULT_SOURCE_CONTEXT_MAX_FILES,
         help="Maximum source files included in each prompt.",
     )
+    parser.add_argument(
+        "--include-source-tests",
+        action="store_true",
+        help=(
+            "Include small upstream test/example source files as optional sidecar context. "
+            "Equivalent to --test-context-mode snippets unless a test mode is set."
+        ),
+    )
+    parser.add_argument(
+        "--test-context-mode",
+        choices=TEST_CONTEXT_MODES,
+        default="none",
+        help=(
+            "Optional upstream test/example context mode: none, metadata, snippets, or fixtures. "
+            "Fixtures includes small expected-output/data files from test/example directories."
+        ),
+    )
+    parser.add_argument(
+        "--test-context-max-chars",
+        type=int,
+        default=DEFAULT_TEST_CONTEXT_MAX_CHARS,
+        help="Maximum test/example context characters included in each prompt.",
+    )
+    parser.add_argument(
+        "--test-context-max-files",
+        type=int,
+        default=DEFAULT_TEST_CONTEXT_MAX_FILES,
+        help="Maximum test/example files included in each prompt.",
+    )
+    parser.add_argument(
+        "--test-context-max-file-bytes",
+        type=_parse_optional_byte_cap,
+        default=DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES,
+        help="Maximum bytes per test/example context file; 0 disables this per-file cap.",
+    )
     if include_source_root:
         target = source_root_target or parser
         target.add_argument(
@@ -280,12 +319,31 @@ def _source_context_settings_from_args(
     resolved_source_root = (
         source_root if source_root is not None else _optional_path(getattr(args, "source_root", ""))
     )
+    test_context_mode = getattr(args, "test_context_mode", "none")
+    if getattr(args, "include_source_tests", False) and test_context_mode == "none":
+        test_context_mode = "snippets"
     return source_context_settings(
         mode=args.source_context_mode,
         max_chars=args.source_context_max_chars,
         max_files=args.source_context_max_files,
         source_root=resolved_source_root,
         source_file=_optional_path(getattr(args, "source_file", "")),
+        test_context_mode=test_context_mode,
+        test_context_max_chars=getattr(
+            args,
+            "test_context_max_chars",
+            DEFAULT_TEST_CONTEXT_MAX_CHARS,
+        ),
+        test_context_max_files=getattr(
+            args,
+            "test_context_max_files",
+            DEFAULT_TEST_CONTEXT_MAX_FILES,
+        ),
+        test_context_max_file_bytes=getattr(
+            args,
+            "test_context_max_file_bytes",
+            DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES,
+        ),
     )
 
 
@@ -2011,7 +2069,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_PROMPT_HELP_CHARS,
         help="Maximum help-text characters included in each generation prompt.",
     )
-    _add_source_context_args(bench_parser, include_source_root=True)
+    _add_source_context_args(
+        bench_parser,
+        include_source_root=True,
+        include_source_file=True,
+    )
     bench_parser.add_argument(
         "--suite-generation",
         choices=["single", "recommend", "generate"],

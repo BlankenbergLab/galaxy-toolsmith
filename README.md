@@ -195,6 +195,11 @@ gtsm generate-suite \
   --stream-output
 ```
 
+Upstream tests, examples, and small fixtures are excluded from the primary
+`all-filtered` source budget by default. Add `--include-source-tests` or an
+explicit `--test-context-mode metadata|snippets|fixtures` when training or
+generation should receive those files as separate sidecar context.
+
 XML generation always treats the main output as the primary Galaxy `<tool>`
 wrapper. Companion files such as `macros.xml`, `tool_data_table_conf.xml`, and
 `.loc.sample` files are sidecars and are written separately when requested.

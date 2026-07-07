@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from galaxy_toolsmith.cli.main import _build_parser, _suite_generation_help_text_from_args
+from galaxy_toolsmith.cli.main import (
+    _build_parser,
+    _source_context_settings_from_args,
+    _suite_generation_help_text_from_args,
+)
 from galaxy_toolsmith.inference.runtime_discovery import RuntimeDiscoveryResult
 
 
@@ -63,6 +67,13 @@ def test_train_backend_flags_parse() -> None:
             "6000",
             "--source-context-max-files",
             "5",
+            "--include-source-tests",
+            "--test-context-max-chars",
+            "1200",
+            "--test-context-max-files",
+            "3",
+            "--test-context-max-file-bytes",
+            "32KiB",
             "--source-root",
             "/tmp/source-root",
             "--source-file",
@@ -95,6 +106,16 @@ def test_train_backend_flags_parse() -> None:
     assert args.source_context_mode == "snippets"
     assert args.source_context_max_chars == 6000
     assert args.source_context_max_files == 5
+    assert args.include_source_tests is True
+    assert args.test_context_mode == "none"
+    assert args.test_context_max_chars == 1200
+    assert args.test_context_max_files == 3
+    assert args.test_context_max_file_bytes == 32 * 1024
+    source_context = _source_context_settings_from_args(args)
+    assert source_context.test_context_mode == "snippets"
+    assert source_context.test_context_max_chars == 1200
+    assert source_context.test_context_max_files == 3
+    assert source_context.test_context_max_file_bytes == 32 * 1024
     assert args.source_root == "/tmp/source-root"
     assert args.source_file == "/tmp/source.py"
     assert args.per_device_batch_size == 1
@@ -220,6 +241,38 @@ def test_generate_wrapper_runtime_discovery_flags_parse_without_help_file() -> N
     assert args.discovery_command == "minibwa"
     assert args.discovery_source_download_max_bytes == 1024**3
     assert args.discover_subcommands is True
+
+
+def test_generate_suite_test_context_flags_parse() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "generate-suite",
+            "--tool-name",
+            "minibwa",
+            "--help-text-file",
+            "help.txt",
+            "--source-context-mode",
+            "all-filtered",
+            "--test-context-mode",
+            "fixtures",
+            "--test-context-max-chars",
+            "2400",
+            "--test-context-max-files",
+            "8",
+            "--test-context-max-file-bytes",
+            "64KB",
+            "--output-dir",
+            "/tmp/minibwa-suite",
+        ]
+    )
+
+    source_context = _source_context_settings_from_args(args)
+    assert source_context.mode == "all-filtered"
+    assert source_context.test_context_mode == "fixtures"
+    assert source_context.test_context_max_chars == 2400
+    assert source_context.test_context_max_files == 8
+    assert source_context.test_context_max_file_bytes == 64_000
 
 
 def test_generate_wrapper_source_archive_conflicts_with_source_root() -> None:

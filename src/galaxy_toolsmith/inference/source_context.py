@@ -19,9 +19,22 @@ SOURCE_CONTEXT_MODES = (
     SOURCE_CONTEXT_MODE_ALL_FILTERED,
     SOURCE_CONTEXT_MODE_ALL_RAW,
 )
+TEST_CONTEXT_MODE_NONE = "none"
+TEST_CONTEXT_MODE_METADATA = "metadata"
+TEST_CONTEXT_MODE_SNIPPETS = "snippets"
+TEST_CONTEXT_MODE_FIXTURES = "fixtures"
+TEST_CONTEXT_MODES = (
+    TEST_CONTEXT_MODE_NONE,
+    TEST_CONTEXT_MODE_METADATA,
+    TEST_CONTEXT_MODE_SNIPPETS,
+    TEST_CONTEXT_MODE_FIXTURES,
+)
 
 DEFAULT_SOURCE_CONTEXT_MAX_CHARS = 8000
 DEFAULT_SOURCE_CONTEXT_MAX_FILES = 12
+DEFAULT_TEST_CONTEXT_MAX_CHARS = 4000
+DEFAULT_TEST_CONTEXT_MAX_FILES = 4
+DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES = 64_000
 MAX_SOURCE_FILE_BYTES = 256_000
 FILE_SAMPLE_BYTES = 8192
 
@@ -124,6 +137,46 @@ EXCLUDED_DIRS = {
     "vendor",
     "vendors",
 }
+TEST_CONTEXT_DIRS = {
+    "api-test",
+    "api-tests",
+    "demo",
+    "demos",
+    "example",
+    "examples",
+    "fixture",
+    "fixtures",
+    "test",
+    "test-data",
+    "test_data",
+    "tests",
+}
+TEST_CONTEXT_SCRIPT_EXTENSIONS = SOURCE_EXTENSIONS | {
+    ".expected",
+    ".out",
+    ".stderr",
+    ".stdout",
+}
+TEST_CONTEXT_FIXTURE_EXTENSIONS = {
+    ".bed",
+    ".csv",
+    ".fa",
+    ".fasta",
+    ".fastq",
+    ".fq",
+    ".gff",
+    ".gtf",
+    ".json",
+    ".paf",
+    ".sam",
+    ".tab",
+    ".tabular",
+    ".tsv",
+    ".txt",
+    ".vcf",
+    ".yaml",
+    ".yml",
+}
 CLI_PATTERNS = (
     "ArgumentParser",
     "OptionParser",
@@ -143,12 +196,29 @@ class SourceContextSettings:
     max_files: int = DEFAULT_SOURCE_CONTEXT_MAX_FILES
     source_root: Path | None = None
     source_file: Path | None = None
+    test_context_mode: str = TEST_CONTEXT_MODE_NONE
+    test_context_max_chars: int = DEFAULT_TEST_CONTEXT_MAX_CHARS
+    test_context_max_files: int = DEFAULT_TEST_CONTEXT_MAX_FILES
+    test_context_max_file_bytes: int = DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES
 
     def normalized(self) -> SourceContextSettings:
         mode = normalize_source_context_mode(self.mode)
+        test_context_mode = normalize_test_context_mode(self.test_context_mode)
         max_chars = max(0, int(self.max_chars))
         max_files = max(0, int(self.max_files))
-        return replace(self, mode=mode, max_chars=max_chars, max_files=max_files)
+        test_context_max_chars = max(0, int(self.test_context_max_chars))
+        test_context_max_files = max(0, int(self.test_context_max_files))
+        test_context_max_file_bytes = max(0, int(self.test_context_max_file_bytes))
+        return replace(
+            self,
+            mode=mode,
+            max_chars=max_chars,
+            max_files=max_files,
+            test_context_mode=test_context_mode,
+            test_context_max_chars=test_context_max_chars,
+            test_context_max_files=test_context_max_files,
+            test_context_max_file_bytes=test_context_max_file_bytes,
+        )
 
     def with_paths(
         self,
@@ -177,6 +247,11 @@ class SourceContextResult:
     included_chars: int = 0
     truncated: bool = False
     included_paths: tuple[str, ...] = ()
+    test_context_mode: str = TEST_CONTEXT_MODE_NONE
+    included_test_files: int = 0
+    included_test_chars: int = 0
+    test_context_truncated: bool = False
+    included_test_paths: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -200,7 +275,9 @@ class _PreparedSourceContext:
     metadata_mappings: tuple[Mapping[str, Any], ...]
     wrapper_metadata: str
     candidate_files: tuple[_SourceFile, ...]
+    test_candidate_files: tuple[_SourceFile, ...] = ()
     scanned_files: int = 0
+    scanned_test_files: int = 0
     errors: tuple[str, ...] = ()
 
 
@@ -213,6 +290,15 @@ def normalize_source_context_mode(mode: str | None) -> str:
     return normalized
 
 
+def normalize_test_context_mode(mode: str | None) -> str:
+    normalized = (mode or TEST_CONTEXT_MODE_NONE).strip().lower().replace("_", "-")
+    if normalized not in TEST_CONTEXT_MODES:
+        raise ValueError(
+            "Unsupported test context mode. Use one of: " + ", ".join(TEST_CONTEXT_MODES)
+        )
+    return normalized
+
+
 def source_context_settings(
     *,
     mode: str | None = None,
@@ -220,6 +306,10 @@ def source_context_settings(
     max_files: int | None = None,
     source_root: Path | None = None,
     source_file: Path | None = None,
+    test_context_mode: str | None = None,
+    test_context_max_chars: int | None = None,
+    test_context_max_files: int | None = None,
+    test_context_max_file_bytes: int | None = None,
 ) -> SourceContextSettings:
     return SourceContextSettings(
         mode=normalize_source_context_mode(mode),
@@ -227,6 +317,22 @@ def source_context_settings(
         max_files=DEFAULT_SOURCE_CONTEXT_MAX_FILES if max_files is None else int(max_files),
         source_root=source_root,
         source_file=source_file,
+        test_context_mode=normalize_test_context_mode(test_context_mode),
+        test_context_max_chars=(
+            DEFAULT_TEST_CONTEXT_MAX_CHARS
+            if test_context_max_chars is None
+            else int(test_context_max_chars)
+        ),
+        test_context_max_files=(
+            DEFAULT_TEST_CONTEXT_MAX_FILES
+            if test_context_max_files is None
+            else int(test_context_max_files)
+        ),
+        test_context_max_file_bytes=(
+            DEFAULT_TEST_CONTEXT_MAX_FILE_BYTES
+            if test_context_max_file_bytes is None
+            else int(test_context_max_file_bytes)
+        ),
     ).normalized()
 
 
@@ -235,7 +341,10 @@ def build_source_context_from_record(
     settings: SourceContextSettings | None,
 ) -> SourceContextResult:
     settings = (settings or SourceContextSettings()).normalized()
-    if settings.mode == SOURCE_CONTEXT_MODE_NONE:
+    if (
+        settings.mode == SOURCE_CONTEXT_MODE_NONE
+        and settings.test_context_mode == TEST_CONTEXT_MODE_NONE
+    ):
         return _empty_result(settings)
 
     prepared = _prepare_source_context_from_record(record, settings)
@@ -253,15 +362,20 @@ def build_source_context_variants_from_record(
         for settings in settings_list
     ]
     results: list[SourceContextResult | None] = [None] * len(normalized)
-    grouped_indexes: dict[tuple[str, str, str], list[int]] = {}
+    grouped_indexes: dict[tuple[str, str, str, str, int], list[int]] = {}
     for index, settings in enumerate(normalized):
-        if settings.mode == SOURCE_CONTEXT_MODE_NONE:
+        if (
+            settings.mode == SOURCE_CONTEXT_MODE_NONE
+            and settings.test_context_mode == TEST_CONTEXT_MODE_NONE
+        ):
             results[index] = _empty_result(settings)
             continue
         key = (
             settings.mode,
             str(settings.source_root or ""),
             str(settings.source_file or ""),
+            settings.test_context_mode,
+            settings.test_context_max_file_bytes,
         )
         grouped_indexes.setdefault(key, []).append(index)
 
@@ -317,6 +431,15 @@ def build_source_context_from_paths(
         source_file=source_file,
     )
     if settings.mode == SOURCE_CONTEXT_MODE_NONE:
+        if settings.test_context_mode != TEST_CONTEXT_MODE_NONE:
+            return _build_source_context(
+                settings=settings,
+                metadata_mappings=[],
+                wrapper_metadata="",
+                wrapper_sources=[],
+                roots=[source_root] if source_root is not None else [],
+                files=[source_file] if source_file is not None else [],
+            )
         if source_file is None:
             return _empty_result(settings)
         try:
@@ -353,6 +476,7 @@ def _empty_result(
         max_chars=settings.max_chars,
         max_files=settings.max_files,
         errors=errors,
+        test_context_mode=settings.test_context_mode,
     )
 
 
@@ -605,46 +729,75 @@ def _prepare_source_context(
     settings = settings.normalized()
     keywords = _keywords_from_mappings(metadata_mappings)
 
-    if settings.mode == SOURCE_CONTEXT_MODE_METADATA:
-        return _PreparedSourceContext(
-            settings=settings,
-            metadata_mappings=tuple(metadata_mappings),
-            wrapper_metadata=wrapper_metadata,
-            candidate_files=(),
-        )
-
     errors: list[str] = []
     scanned_files = 0
-    candidate_files: list[_SourceFile] = list(wrapper_sources)
-    for file_path in files:
-        if file_path is None:
-            continue
-        source_file = _manual_source_file(file_path, keywords=keywords)
-        if source_file is None:
-            errors.append(f"{file_path}: not a readable text source file")
-            continue
-        candidate_files.append(source_file)
+    scanned_test_files = 0
+    candidate_files: list[_SourceFile] = []
+    test_candidate_files: list[_SourceFile] = []
 
-    for root in roots:
-        if root is None:
-            continue
-        scanned, candidates, root_errors = _scan_source_root(
-            root,
-            mode=settings.mode,
-            keywords=keywords,
-        )
-        scanned_files += scanned
-        candidate_files.extend(candidates)
-        errors.extend(root_errors)
+    if settings.mode not in {SOURCE_CONTEXT_MODE_NONE, SOURCE_CONTEXT_MODE_METADATA}:
+        candidate_files.extend(wrapper_sources)
+        for file_path in files:
+            if file_path is None:
+                continue
+            source_file = _manual_source_file(file_path, keywords=keywords)
+            if source_file is None:
+                errors.append(f"{file_path}: not a readable text source file")
+                continue
+            candidate_files.append(source_file)
+
+        for root in roots:
+            if root is None:
+                continue
+            scanned, candidates, root_errors = _scan_source_root(
+                root,
+                mode=settings.mode,
+                keywords=keywords,
+            )
+            scanned_files += scanned
+            candidate_files.extend(candidates)
+            errors.extend(root_errors)
+
+    if settings.test_context_mode != TEST_CONTEXT_MODE_NONE:
+        for file_path in files:
+            if file_path is None:
+                continue
+            source_file = _manual_test_context_file(
+                file_path,
+                mode=settings.test_context_mode,
+                max_file_bytes=settings.test_context_max_file_bytes,
+                keywords=keywords,
+            )
+            if source_file is not None:
+                test_candidate_files.append(source_file)
+        for root in roots:
+            if root is None:
+                continue
+            scanned, candidates, root_errors = _scan_test_context_root(
+                root,
+                mode=settings.test_context_mode,
+                max_file_bytes=settings.test_context_max_file_bytes,
+                keywords=keywords,
+            )
+            scanned_test_files += scanned
+            test_candidate_files.extend(candidates)
+            errors.extend(root_errors)
 
     candidate_files = _dedupe_source_files(candidate_files)
     candidate_files.sort(key=lambda item: (-item.score, item.relpath.lower()))
+    test_candidate_files = _dedupe_test_context_files(
+        test_candidate_files,
+        existing_files=candidate_files,
+    )
+    test_candidate_files.sort(key=lambda item: (-item.score, item.relpath.lower()))
     return _PreparedSourceContext(
         settings=settings,
         metadata_mappings=tuple(metadata_mappings),
         wrapper_metadata=wrapper_metadata,
         candidate_files=tuple(candidate_files),
+        test_candidate_files=tuple(test_candidate_files),
         scanned_files=scanned_files,
+        scanned_test_files=scanned_test_files,
         errors=tuple(errors),
     )
 
@@ -682,14 +835,28 @@ def _render_prepared_source_context(
         )
 
     if settings.mode == SOURCE_CONTEXT_MODE_METADATA:
+        test_text, test_files, test_chars, test_truncated, test_paths, test_errors = (
+            _render_test_context(
+                prepared.test_candidate_files,
+                settings=settings,
+                block_cache=block_cache,
+            )
+        )
+        parts.append(test_text)
+        errors.extend(test_errors)
         return SourceContextResult(
             text="".join(parts).strip(),
             mode=settings.mode,
             max_chars=settings.max_chars,
             max_files=settings.max_files,
             metadata_sources=len(prepared.metadata_mappings),
-            included_chars=used,
+            included_chars=used + test_chars,
             truncated=truncated,
+            test_context_mode=settings.test_context_mode,
+            included_test_files=test_files,
+            included_test_chars=test_chars,
+            test_context_truncated=test_truncated,
+            included_test_paths=test_paths,
             errors=tuple(errors),
         )
 
@@ -721,19 +888,97 @@ def _render_prepared_source_context(
         if used >= settings.max_chars:
             break
 
+    test_text, test_files, test_chars, test_truncated, test_paths, test_errors = _render_test_context(
+        prepared.test_candidate_files,
+        settings=settings,
+        block_cache=block_cache,
+    )
+    parts.append(test_text)
+    errors.extend(test_errors)
+
     return SourceContextResult(
         text="".join(parts).strip(),
         mode=settings.mode,
         max_chars=settings.max_chars,
         max_files=settings.max_files,
         metadata_sources=len(prepared.metadata_mappings),
-        scanned_files=prepared.scanned_files,
+        scanned_files=prepared.scanned_files + prepared.scanned_test_files,
         included_files=included_files,
-        included_chars=used,
+        included_chars=used + test_chars,
         truncated=truncated,
         included_paths=tuple(included_paths),
+        test_context_mode=settings.test_context_mode,
+        included_test_files=test_files,
+        included_test_chars=test_chars,
+        test_context_truncated=test_truncated,
+        included_test_paths=test_paths,
         errors=tuple(errors[:10]),
     )
+
+
+def _render_test_context(
+    candidate_files: Sequence[_SourceFile],
+    *,
+    settings: SourceContextSettings,
+    block_cache: dict[str, tuple[str, str]] | None = None,
+) -> tuple[str, int, int, bool, tuple[str, ...], tuple[str, ...]]:
+    if (
+        settings.test_context_mode == TEST_CONTEXT_MODE_NONE
+        or not candidate_files
+        or settings.test_context_max_chars <= 0
+    ):
+        return "", 0, 0, bool(candidate_files and settings.test_context_max_chars <= 0), (), ()
+
+    parts: list[str] = []
+    used = 0
+    truncated = False
+    errors: list[str] = []
+    included_paths: list[str] = []
+    included_files = 0
+    header = (
+        "\nSource test/example context:\n"
+        "These files are optional behavioral sidecars for examples, expected outputs, "
+        "and small fixtures; the primary generation target remains the tool wrapper.\n"
+    )
+    used, truncated = _append_with_budget(
+        parts,
+        used,
+        header,
+        max_chars=settings.test_context_max_chars,
+        truncated=truncated,
+    )
+
+    if settings.test_context_max_files:
+        selected_files = candidate_files[: settings.test_context_max_files]
+        if len(candidate_files) > len(selected_files):
+            truncated = True
+    else:
+        selected_files = []
+        truncated = True
+
+    for source_file in selected_files:
+        if settings.test_context_mode == TEST_CONTEXT_MODE_METADATA:
+            block, file_error = _test_context_metadata_block(source_file)
+        else:
+            block, file_error = _source_file_block(source_file, block_cache=block_cache)
+        if file_error:
+            errors.append(file_error)
+            continue
+        previous_used = used
+        used, truncated = _append_with_budget(
+            parts,
+            used,
+            block,
+            max_chars=settings.test_context_max_chars,
+            truncated=truncated,
+        )
+        if used > previous_used:
+            included_files += 1
+            included_paths.append(source_file.included_path or str(source_file.path or ""))
+        if used >= settings.test_context_max_chars:
+            break
+
+    return "".join(parts), included_files, used, truncated, tuple(included_paths), tuple(errors)
 
 
 def _source_file_cache_key(source_file: _SourceFile) -> str:
@@ -777,6 +1022,21 @@ def _source_file_block(
     if block_cache is not None:
         block_cache[cache_key] = result
     return result
+
+
+def _test_context_metadata_block(source_file: _SourceFile) -> tuple[str, str]:
+    if source_file.path is None:
+        return "", ""
+    try:
+        stat = source_file.path.stat()
+        digest = hashlib.sha256(source_file.path.read_bytes()).hexdigest()[:16]
+    except OSError as error:
+        return "", f"{source_file.path}: {error}"
+    role = "fixture" if source_file.path.suffix.lower() in TEST_CONTEXT_FIXTURE_EXTENSIONS else "test"
+    return (
+        f"- {source_file.relpath} role={role} bytes={stat.st_size} sha256={digest}\n",
+        "",
+    )
 
 
 def _append_with_budget(
@@ -909,6 +1169,33 @@ def _manual_source_file(path: Path, *, keywords: Sequence[str]) -> _SourceFile |
     )
 
 
+def _manual_test_context_file(
+    path: Path,
+    *,
+    mode: str,
+    max_file_bytes: int,
+    keywords: Sequence[str],
+) -> _SourceFile | None:
+    path = path.expanduser()
+    if not path.exists() or not path.is_file():
+        return None
+    if mode != TEST_CONTEXT_MODE_METADATA and not _is_readable_test_context_file(
+        path,
+        mode=mode,
+        max_file_bytes=max_file_bytes,
+    ):
+        return None
+    root = path.parent
+    return _SourceFile(
+        path=path,
+        root=root,
+        relpath=path.name,
+        score=900 + _score_path(path.name, keywords=keywords) + _score_file_sample(path),
+        label=_test_context_label(path.name),
+        included_path=str(path),
+    )
+
+
 def _scan_source_root(
     root: Path,
     *,
@@ -951,6 +1238,65 @@ def _scan_source_root(
     return scanned, candidates, errors
 
 
+def _scan_test_context_root(
+    root: Path,
+    *,
+    mode: str,
+    max_file_bytes: int,
+    keywords: Sequence[str],
+) -> tuple[int, list[_SourceFile], list[str]]:
+    root = root.expanduser()
+    if root.is_file():
+        root = root.parent
+    if not root.exists() or not root.is_dir():
+        return 0, [], [f"{root}: source root does not exist"]
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        resolved_root = root
+
+    scanned = 0
+    candidates: list[_SourceFile] = []
+    errors: list[str] = []
+    for path in sorted(resolved_root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(resolved_root)
+        except ValueError:
+            continue
+        if _excluded_from_test_context(rel):
+            continue
+        if not _is_test_context_path(rel):
+            continue
+        scanned += 1
+        if mode == TEST_CONTEXT_MODE_METADATA and not _is_candidate_test_context_file(
+            path,
+            mode=TEST_CONTEXT_MODE_FIXTURES,
+        ):
+            continue
+        if mode != TEST_CONTEXT_MODE_METADATA and not _is_readable_test_context_file(
+            path,
+            mode=mode,
+            max_file_bytes=max_file_bytes,
+        ):
+            continue
+        relpath = rel.as_posix()
+        score = 900 + _score_test_context_path(relpath, mode=mode, keywords=keywords)
+        if mode != TEST_CONTEXT_MODE_METADATA:
+            score += _score_file_sample(path)
+        candidates.append(
+            _SourceFile(
+                path=path,
+                root=resolved_root,
+                relpath=relpath,
+                score=score,
+                label=_test_context_label(relpath),
+            )
+        )
+    return scanned, candidates, errors
+
+
 def _dedupe_source_files(files: Sequence[_SourceFile]) -> list[_SourceFile]:
     seen: set[str] = set()
     deduped: list[_SourceFile] = []
@@ -974,6 +1320,23 @@ def _dedupe_source_files(files: Sequence[_SourceFile]) -> list[_SourceFile]:
     return deduped
 
 
+def _dedupe_test_context_files(
+    files: Sequence[_SourceFile],
+    *,
+    existing_files: Sequence[_SourceFile],
+) -> list[_SourceFile]:
+    existing_keys = {_source_file_cache_key(source_file) for source_file in existing_files}
+    deduped: list[_SourceFile] = []
+    seen: set[str] = set()
+    for source_file in files:
+        key = _source_file_cache_key(source_file)
+        if key in existing_keys or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(source_file)
+    return deduped
+
+
 def _excluded_by_path(relpath: Path, *, mode: str) -> bool:
     parts = relpath.parts
     if any(part in {".git", ".hg", "__pycache__"} for part in parts):
@@ -986,6 +1349,18 @@ def _excluded_by_path(relpath: Path, *, mode: str) -> bool:
     return any(rel_posix.startswith(excluded + "/") for excluded in EXCLUDED_DIRS)
 
 
+def _excluded_from_test_context(relpath: Path) -> bool:
+    parts = relpath.parts
+    if any(part in {".git", ".hg", "__pycache__", ".pytest_cache", ".tox", ".venv"} for part in parts):
+        return True
+    return any(part in {"build", "dist", "node_modules", "site-packages", "venv"} for part in parts)
+
+
+def _is_test_context_path(relpath: Path) -> bool:
+    parts = {part.lower() for part in relpath.parts[:-1]}
+    return bool(parts & TEST_CONTEXT_DIRS)
+
+
 def _candidate_source_file(path: Path, *, mode: str) -> bool:
     suffix = path.suffix.lower()
     if suffix in BINARY_OR_DATA_EXTENSIONS:
@@ -995,6 +1370,25 @@ def _candidate_source_file(path: Path, *, mode: str) -> bool:
     return suffix in SOURCE_EXTENSIONS or path.name in SOURCE_BASENAMES
 
 
+def _is_candidate_test_context_file(path: Path, *, mode: str) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in TEST_CONTEXT_SCRIPT_EXTENSIONS or path.name in SOURCE_BASENAMES:
+        return True
+    return mode == TEST_CONTEXT_MODE_FIXTURES and suffix in TEST_CONTEXT_FIXTURE_EXTENSIONS
+
+
+def _is_readable_test_context_file(path: Path, *, mode: str, max_file_bytes: int) -> bool:
+    if not _is_candidate_test_context_file(path, mode=mode):
+        return False
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if max_file_bytes > 0 and stat.st_size > max_file_bytes:
+        return False
+    return _looks_like_text_file(path)
+
+
 def _is_readable_text_source(path: Path) -> bool:
     try:
         stat = path.stat()
@@ -1002,6 +1396,10 @@ def _is_readable_text_source(path: Path) -> bool:
         return False
     if stat.st_size > MAX_SOURCE_FILE_BYTES:
         return False
+    return _looks_like_text_file(path)
+
+
+def _looks_like_text_file(path: Path) -> bool:
     try:
         chunk = path.read_bytes()[:FILE_SAMPLE_BYTES]
     except OSError:
@@ -1055,6 +1453,27 @@ def _score_path(relpath: str, *, keywords: Sequence[str]) -> int:
     for keyword in keywords:
         if keyword and keyword in normalized_path:
             score += 50
+    return score
+
+
+def _test_context_label(relpath: str) -> str:
+    suffix = Path(relpath).suffix.lower()
+    if suffix in TEST_CONTEXT_FIXTURE_EXTENSIONS:
+        return "Source test/example fixture"
+    return "Source test/example file"
+
+
+def _score_test_context_path(relpath: str, *, mode: str, keywords: Sequence[str]) -> int:
+    rel_lower = relpath.lower()
+    basename = Path(relpath).name.lower()
+    score = _score_path(relpath, keywords=keywords)
+    if "/test" in f"/{rel_lower}" or "/example" in f"/{rel_lower}" or "/demo" in f"/{rel_lower}":
+        score += 45
+    if basename.startswith(("test_", "test-", "example", "expected")):
+        score += 35
+    suffix = Path(relpath).suffix.lower()
+    if suffix in TEST_CONTEXT_FIXTURE_EXTENSIONS:
+        score += 10 if mode == TEST_CONTEXT_MODE_FIXTURES else -25
     return score
 
 

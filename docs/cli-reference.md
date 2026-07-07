@@ -40,6 +40,11 @@ provided manually.
 | `--source-context-mode all-raw` | Include source files with minimal filtering. Use only for diagnostics because it can waste context on tests, vendored code, and generated files. |
 | `--source-context-max-chars <n>` | Maximum source-context characters added to a single prompt or training sample. |
 | `--source-context-max-files <n>` | Maximum source files added to a single prompt or training sample. |
+| `--include-source-tests` | Shortcut for adding upstream test/example snippets as optional sidecar context. Equivalent to `--test-context-mode snippets` when no explicit test mode is set. |
+| `--test-context-mode none|metadata|snippets|fixtures` | Optional source test/example context. `metadata` lists files only, `snippets` includes small test/example source files, and `fixtures` also allows small expected-output or fixture data from test/example directories. |
+| `--test-context-max-chars <n>` | Separate character budget for source test/example context. |
+| `--test-context-max-files <n>` | Separate file-count budget for source test/example context. |
+| `--test-context-max-file-bytes <size>` | Per-file cap for source test/example files. Human-readable values such as `64KB` and `32KiB` are accepted; `0` disables this cap. |
 | `--source-root <dir>` | Scan a manual source tree for one-off generation or training input. |
 | `--source-file <path>` | Include one manual source file for one-off generation or training input. |
 | `--source-archive <path-or-url>` | For one-off generation, copy or download a source archive, safely extract it into `.gtsm-cache/manual-sources/archives/`, and scan the extracted source tree. Supports local paths plus HTTP(S)/FTP URLs. |
@@ -47,7 +52,9 @@ provided manually.
 When source checkout metadata comes from `extract-corpus`, the source context
 loader uses the recorded package/version mappings and cached upstream source
 trees. For archive downloads, the extracted source tree is used, not just the
-conda recipe.
+conda recipe. `all-filtered` intentionally excludes tests and fixtures from the
+primary source budget; use `--test-context-mode` when they should be included as
+explicit sidecar context.
 
 ### Runtime discovery for generation
 
@@ -464,6 +471,11 @@ gtsm estimate-training-tokens \
 | `--source-context-mode <mode>` | Base source-context mode. |
 | `--compare-source-context-modes <list>` | Compare multiple source modes, such as `all-raw,all-filtered`. |
 | `--source-context-budget-ladder` | Use built-in source char/file budgets for each context length, including 8k/4k/2k fallbacks. |
+| `--include-source-tests` | Include upstream test/example snippets in estimated training samples. |
+| `--test-context-mode <mode>` | Optional test/example source context mode. See [Source Context](#source-context). |
+| `--test-context-max-chars <n>` | Test/example context character budget used in estimates. |
+| `--test-context-max-files <n>` | Test/example file count budget used in estimates. |
+| `--test-context-max-file-bytes <size>` | Per-file cap for test/example files. |
 | `--limit <n>` | Estimate only the first `n` corpus records. `0` means full corpus. |
 | `--exact-tokenizer` | Use the profile tokenizer from local model cache instead of character-ratio estimates. |
 | `--chars-per-token <float>` | Character-ratio estimate used without `--exact-tokenizer`. |
@@ -519,6 +531,11 @@ gtsm train \
 | `--source-context-mode <mode>` | Include underlying source context in training samples. See [Source Context](#source-context). |
 | `--source-context-max-chars <n>` | Per-sample source context character budget. |
 | `--source-context-max-files <n>` | Per-sample source file count budget. |
+| `--include-source-tests` | Include upstream test/example snippets as optional sidecar context in training samples. |
+| `--test-context-mode <mode>` | Optional test/example source context mode. See [Source Context](#source-context). |
+| `--test-context-max-chars <n>` | Per-sample test/example context character budget. |
+| `--test-context-max-files <n>` | Per-sample test/example file count budget. |
+| `--test-context-max-file-bytes <size>` | Per-file cap for test/example files. |
 | `--source-root <dir>` | Manual source tree for samples that need extra context. |
 | `--source-file <path>` | Manual source file for samples that need extra context. |
 | `--per-device-batch-size <n>` | Override profile per-device batch size. |
@@ -741,6 +758,11 @@ gtsm generate-wrapper \
 | `--source-context-mode <mode>` | Source-code context mode. |
 | `--source-context-max-chars <n>` | Source context character budget. |
 | `--source-context-max-files <n>` | Source file count budget. |
+| `--include-source-tests` | Include upstream test/example snippets as optional sidecar context. |
+| `--test-context-mode <mode>` | Optional test/example source context mode. See [Source Context](#source-context). |
+| `--test-context-max-chars <n>` | Test/example source context character budget. |
+| `--test-context-max-files <n>` | Test/example source file count budget. |
+| `--test-context-max-file-bytes <size>` | Per-file cap for test/example files. |
 | `--source-root <dir>` | Source tree to scan. |
 | `--source-archive <path-or-url>` | Source archive path or URL to extract and scan. Mutually exclusive with `--source-root`. |
 | `--source-archive-max-bytes <size>` | Archive cap for local copy or URL download. Defaults to `1GB`; use `0` for unlimited. |
@@ -1150,7 +1172,13 @@ GTSM_OLLAMA_TIMEOUT_SECONDS=900 gtsm benchmark-generate \
 | `--source-context-mode <mode>` | Source-code context mode. |
 | `--source-context-max-chars <n>` | Source context character budget. |
 | `--source-context-max-files <n>` | Source file count budget. |
+| `--include-source-tests` | Include upstream test/example snippets as optional sidecar context. |
+| `--test-context-mode <mode>` | Optional test/example source context mode. See [Source Context](#source-context). |
+| `--test-context-max-chars <n>` | Test/example source context character budget. |
+| `--test-context-max-files <n>` | Test/example source file count budget. |
+| `--test-context-max-file-bytes <size>` | Per-file cap for test/example files. |
 | `--source-root <dir>` | Manual source tree to scan. |
+| `--source-file <path>` | Manual source file to include in each benchmark prompt. |
 | `--suite-generation single|recommend|generate` | Suite handling. `single` keeps one wrapper per record, `recommend` records a suite plan, and `generate` writes repository bundles and evaluates all generated XML wrappers. |
 | `--max-suite-tools <n>` | Maximum suite members for recommendation or suite generation. |
 | `--repair-invalid-xml` | Retry malformed/non-tool/degenerate XML once with a stricter prompt. Enabled by default. |

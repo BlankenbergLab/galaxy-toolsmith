@@ -580,6 +580,144 @@ def main():
     assert diagnostics["source_context_chars"] > 0
 
 
+def test_load_instruction_records_can_include_test_context_without_source_context(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    (source_root / "tests").mkdir(parents=True)
+    (source_root / "tests" / "test_cli.py").write_text(
+        "def test_cli_accepts_fastq():\n    assert 'reads.fq'\n",
+        encoding="utf-8",
+    )
+    wrapper_path = tmp_path / "wrapper.xml"
+    wrapper_path.write_text(
+        '<tool id="testtool" name="Test Tool"><command>testtool</command></tool>',
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "testtool",
+                "wrapper_path": str(wrapper_path),
+                "help_text": "Usage: testtool --reads reads.fq",
+                "bioconda_sources": [
+                    {
+                        "package": "testtool",
+                        "source_checkout": str(source_root),
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records, diagnostics = _load_instruction_records_with_diagnostics(
+        corpus_jsonl,
+        _training_profile(),
+        repo_root=tmp_path,
+        source_context_settings=source_context_settings(
+            mode="none",
+            test_context_mode="snippets",
+            test_context_max_chars=2000,
+            test_context_max_files=3,
+        ),
+    )
+
+    assert len(records) == 1
+    prompt = records[0]["instruction"]
+    assert "Source test/example context:" in prompt
+    assert "test_cli_accepts_fastq" in prompt
+    assert diagnostics["source_context_mode"] == "none"
+    assert diagnostics["test_context_mode"] == "snippets"
+    assert diagnostics["test_context_records"] == 1
+    assert diagnostics["test_context_files"] == 1
+    assert diagnostics["test_context_chars"] > 0
+
+
+def test_load_instruction_records_adds_repair_feedback_samples(tmp_path: Path) -> None:
+    wrapper_path = tmp_path / "wrapper.xml"
+    wrapper_path.write_text(
+        '<tool id="repairtool" name="Repair Tool"><command>repairtool</command></tool>',
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "repairtool",
+                "wrapper_path": str(wrapper_path),
+                "help_text": "Usage: repairtool --input reads.fq",
+                "repair_feedback": [
+                    {
+                        "generated_xml": "<tool><command>repairtool --help</command></tool>",
+                        "feedback": "The command runs help instead of the real operation.",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records, diagnostics = _load_instruction_records_with_diagnostics(
+        corpus_jsonl,
+        _training_profile(),
+        repo_root=tmp_path,
+    )
+
+    assert len(records) == 2
+    assert records[1]["instruction"].startswith("Repair the following generated Galaxy tool XML")
+    assert "runs help instead of the real operation" in records[1]["instruction"]
+    assert records[1]["output"].startswith('<tool id="repairtool"')
+    assert diagnostics["records_with_repair_feedback"] == 1
+    assert diagnostics["repair_training_samples"] == 1
+    assert diagnostics["target_source_counts"] == {
+        "wrapper": 1,
+        "xml_repair:feedback": 1,
+    }
+
+
+def test_load_instruction_records_reports_quality_warnings(tmp_path: Path) -> None:
+    wrapper_path = tmp_path / "wrapper.xml"
+    wrapper_path.write_text(
+        """
+<tool id="qualitytool" name="Quality Tool">
+  <command>qualitytool --help</command>
+  <inputs>
+    <param name="input" type="data" optional="true" />
+  </inputs>
+</tool>
+""".strip(),
+        encoding="utf-8",
+    )
+    corpus_jsonl = tmp_path / "corpus.jsonl"
+    corpus_jsonl.write_text(
+        json.dumps(
+            {
+                "tool_name": "qualitytool",
+                "wrapper_path": str(wrapper_path),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _records, diagnostics = _load_instruction_records_with_diagnostics(
+        corpus_jsonl,
+        _training_profile(),
+        repo_root=tmp_path,
+    )
+
+    assert diagnostics["records_with_missing_effective_help"] == 1
+    assert diagnostics["records_with_help_only_command"] == 1
+    assert diagnostics["records_with_optional_only_inputs"] == 1
+    assert diagnostics["missing_effective_help_examples"] == [{"tool_name": "qualitytool"}]
+    assert diagnostics["help_only_command_examples"][0]["command"] == "qualitytool --help"
+    assert diagnostics["optional_only_input_examples"] == [{"tool_name": "qualitytool"}]
+
+
 def test_load_instruction_records_uses_training_data_workers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1212,6 +1350,13 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
         stream_logs=True,
         log_tail_lines=7,
         max_steps=5,
+        source_context_settings=source_context_settings(
+            mode="none",
+            test_context_mode="fixtures",
+            test_context_max_chars=1234,
+            test_context_max_files=2,
+            test_context_max_file_bytes=999,
+        ),
     )
 
     assert command[:4] == [command[0], "-m", "torch.distributed.run", "--standalone"]
@@ -1233,6 +1378,14 @@ def test_hf_sft_distributed_launch_command_uses_torchrun(tmp_path: Path) -> None
     assert "full" in command
     assert "--max-steps" in command
     assert "5" in command
+    assert "--test-context-mode" in command
+    assert "fixtures" in command
+    assert "--test-context-max-chars" in command
+    assert "1234" in command
+    assert "--test-context-max-files" in command
+    assert "2" in command
+    assert "--test-context-max-file-bytes" in command
+    assert "999" in command
     assert "--status-log" in command
     assert str(tmp_path / "train.status.jsonl") in command
     assert "--stream-logs" in command
@@ -1524,6 +1677,10 @@ def test_run_training_axolotl_dry_run_writes_config_and_dataset(tmp_path: Path) 
     assert config["datasets"][0]["path"] == str(dataset_path)
     assert config["cache_dir"] == str(paths.models_root / "hf-cache")
     assert metrics["model_source_policy"]["cache_dir"] == str(paths.models_root / "hf-cache")
+    assert metrics["training_data_manifest"]["schema_version"] == 1
+    assert metrics["training_data_manifest"]["artifact_format"] == "xml"
+    assert len(metrics["training_data_manifest"]["corpus_jsonl_sha256"]) == 64
+    assert len(metrics["training_data_manifest"]["dataset_manifest_sha256"]) == 64
     assert metrics["training_data_diagnostics"]["total_corpus_records"] == 1
     assert metrics["training_data_diagnostics"]["trainable_samples"] == 1
     assert metrics["training_data_diagnostics"]["target_source_counts"] == {"expanded": 1}

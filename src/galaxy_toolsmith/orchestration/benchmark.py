@@ -1556,6 +1556,22 @@ def _build_shard_command(
         command.extend(["--source-context-max-files", str(source_context_settings.max_files)])
         if source_context_settings.source_root is not None:
             command.extend(["--source-root", str(source_context_settings.source_root)])
+        if source_context_settings.source_file is not None:
+            command.extend(["--source-file", str(source_context_settings.source_file)])
+    if source_context_settings.test_context_mode != "none":
+        command.extend(["--test-context-mode", source_context_settings.test_context_mode])
+        command.extend(
+            ["--test-context-max-chars", str(source_context_settings.test_context_max_chars)]
+        )
+        command.extend(
+            ["--test-context-max-files", str(source_context_settings.test_context_max_files)]
+        )
+        command.extend(
+            [
+                "--test-context-max-file-bytes",
+                str(source_context_settings.test_context_max_file_bytes),
+            ]
+        )
     return command
 
 
