@@ -76,3 +76,18 @@ def test_context_ladder_supports_external_gguf_export_env() -> None:
     assert "run_external_post_export" in script_text
     assert "scripts/gtsm_llama_cpp_gguf.sh" in script_text
     assert "post-export-failed" in script_text
+
+
+def test_context_ladder_forwards_test_context_to_estimation_and_training() -> None:
+    script_text = SCRIPT.read_text(encoding="utf-8")
+
+    assert ": \"${TEST_CONTEXT_MODE:=fixtures}\"" in script_text
+    assert ": \"${TEST_CONTEXT_MAX_CHARS:=4000}\"" in script_text
+    assert ": \"${TEST_CONTEXT_MAX_FILES:=6}\"" in script_text
+    assert ": \"${TEST_CONTEXT_MAX_FILE_BYTES:=64KB}\"" in script_text
+    assert script_text.count("--test-context-mode") >= 3
+    assert script_text.count("--test-context-max-chars") >= 3
+    assert script_text.count("--test-context-max-files") >= 3
+    assert script_text.count("--test-context-max-file-bytes") >= 3
+    assert "\"TEST_CONTEXT_MODE=$TEST_CONTEXT_MODE\"" in script_text
+    assert "printf 'TEST_CONTEXT_MODE=%q\\n' \"$TEST_CONTEXT_MODE\"" in script_text

@@ -157,6 +157,10 @@ length, distributed strategy, and run tag.
 | `ARTIFACT_FORMAT` | `mixed` | Training target format. |
 | `CORPUS_JSONL` | `.gtsm-cache/datasets/tools-iuc-corpus.jsonl` | Corpus JSONL. |
 | `SOURCE_MODES` | `all-raw,all-filtered` | Source context modes to estimate. |
+| `TEST_CONTEXT_MODE` | `fixtures` | Optional upstream test/example sidecar context mode forwarded to token estimation and training. Use `none`, `metadata`, `snippets`, or `fixtures`. |
+| `TEST_CONTEXT_MAX_CHARS` | `4000` | Maximum test/example sidecar characters per prompt. |
+| `TEST_CONTEXT_MAX_FILES` | `6` | Maximum test/example sidecar files per prompt. |
+| `TEST_CONTEXT_MAX_FILE_BYTES` | `64KB` | Maximum bytes per test/example sidecar file. Accepts human sizes; use `0` for no per-file cap. |
 | `DISTRIBUTED_STRATEGIES` | `deepspeed-zero3,fsdp` | Probe/training strategy order. |
 | `CONTEXT_LADDER` | `128k,96k,64k,48k,32k,24k,16k,12k,8k,4k,2k` | Context candidates. |
 | `PROBE_MAX_STEPS` | `5` | Short training probe steps. |
