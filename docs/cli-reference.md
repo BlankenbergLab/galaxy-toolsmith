@@ -692,6 +692,12 @@ Useful companion variables are `POST_EXPORT_LLAMA_CPP_DIR`,
 
 Convert supported adapter artifacts between local formats.
 
+Install the optional conversion dependencies before using this command:
+
+```bash
+python -m pip install "galaxy-toolsmith[adapter-conversion]"
+```
+
 ```bash
 gtsm convert-adapter \
   --from mlx \

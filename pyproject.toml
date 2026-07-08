@@ -80,6 +80,12 @@ server = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "httpx>=0.27",
+  "anyio>=4.0",
+]
+# MLX LoRA to PEFT adapter conversion.
+adapter-conversion = [
+  "numpy>=1.26",
+  "safetensors>=0.4.5",
 ]
 # Development tooling.
 dev = [
@@ -87,6 +93,12 @@ dev = [
   "pytest-cov>=5.0",
   "ruff>=0.6",
   "mypy>=1.11",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
+  "anyio>=4.0",
+  "numpy>=1.26",
+  "safetensors>=0.4.5",
   "types-requests>=2.31",
   "types-pyyaml>=6.0",
 ]
@@ -97,7 +109,7 @@ docs = [
 ]
 # Convenience meta-extra: everything except platform-specific GPU stacks.
 all = [
-  "galaxy-toolsmith[eval,server,dev,docs]",
+  "galaxy-toolsmith[adapter-conversion,eval,server,dev,docs]",
 ]
 
 [project.scripts]

@@ -136,7 +136,9 @@ def convert_mlx_lora_to_peft(
     try:
         from safetensors.numpy import load_file, save_file
     except Exception as error:  # pragma: no cover - optional dependency boundary
-        raise RuntimeError("Adapter conversion requires the safetensors package.") from error
+        raise RuntimeError(
+            "Adapter conversion requires the numpy and safetensors packages."
+        ) from error
 
     tensors = load_file(str(weights_path))
     lora_params = config.get("lora_parameters") or {}

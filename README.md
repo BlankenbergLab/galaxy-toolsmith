@@ -298,6 +298,8 @@ gtsm train-artifacts-fetch --server-url http://127.0.0.1:8765 --job-id <job-id> 
 
 ## Adapter conversion
 - PEFT and MLX adapters are separate artifact formats.
+- Install the conversion dependencies with
+  `python -m pip install "galaxy-toolsmith[adapter-conversion]"`.
 - `gtsm convert-adapter --from mlx --to peft ...` can convert supported MLX
   LoRA adapters for known Qwen/Llama/Mistral-style models.
 - Direct adapter conversion is experimental; the most reliable interchange path
