@@ -42,6 +42,7 @@ nav:
   - Model Selection: models.md
   - Experiments and Results: experiments.md
   - A100 Pipeline Example: example.md
+  - Context Ladder Training: context-ladder-training.md
   - CLI Reference: cli-reference.md
   - Architecture and Decisions: architecture.md
   - Deployment: deployment.md

@@ -13,9 +13,10 @@ Use the CLI (`gtsm`) for workspace setup, corpus extraction, training, evaluatio
 ## Next steps
 
 1. Start with [Quick Start](quickstart.md).
-2. Review [CLI Reference](cli-reference.md).
-3. Use [Context Ladder Training](context-ladder-training.md) for unattended long-context GPU runs.
-4. See [Architecture and Decisions](architecture.md) for design rationale.
+2. Follow the [A100 Pipeline Example](example.md) for the current 4xA100 Devstral sidecar run and minibwa comparison.
+3. Review [CLI Reference](cli-reference.md).
+4. Use [Context Ladder Training](context-ladder-training.md) for unattended long-context GPU runs.
+5. See [Architecture and Decisions](architecture.md) for design rationale.
 
 ## Acknowledgements
 

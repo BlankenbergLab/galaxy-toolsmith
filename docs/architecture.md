@@ -22,6 +22,26 @@ The CLI entrypoint is `gtsm`, but the implementation is intentionally split so
 the same behavior can be used from tests, remote workers, and future workflow
 systems without shelling out.
 
+## End-to-end observed pipeline
+
+The current 4xA100 example uses this full path:
+
+1. Sync `tools-iuc`, Galaxy skills, and Galaxy XSD sources.
+2. Extract a corpus with macro-expanded XML, shed metadata, container help,
+   upstream source, helper/configfile context, and optional test/example
+   sidecars.
+3. Estimate prompt sizes for multiple context/source budget combinations.
+4. Probe the context ladder on the target GPUs with FSDP and DeepSpeed ZeRO-3.
+5. Train the highest passing GPU-only candidate.
+6. Export the trained model to GGUF and quantize to `q4_k_m`.
+7. Register the quantized GGUF with Ollama for local deployment.
+8. Compare full local PEFT generation against q4 Ollama generation on the same
+   suite-generation example.
+
+The 20260707 run selected 12k context, `all-raw` source context, test fixture
+sidecars, and FSDP on 4xA100 40GB. That run is documented in
+`docs/example.md` and `docs/context-ladder-training.md`.
+
 ## Pipeline flows
 
 ### 1. Workspace and source sync
@@ -60,9 +80,11 @@ oversized configfiles are bounded in context instead of bloating corpus records.
 Generation prompts treat those files as context for understanding existing
 wrappers, while still preferring self-contained outputs over newly invented
 external helper scripts.
-In the observed A100 run, the corpus contained 1,985 records, all
-trainable, with 643 records enriched by container help output. XML targets came
-from 197 expanded wrapper records and 1,788 original wrapper targets.
+In the current observed A100 runs, the corpus contained 1,985 trainable records.
+Older extraction summaries reported 643 records enriched by container help
+output, with XML targets from 197 expanded wrapper records and 1,788 original
+wrapper targets. Later sidecar runs used the same corpus path with richer
+source and test/example context.
 
 ### 3. Training
 
@@ -71,22 +93,30 @@ The current policy is to fine-tune non-quantized base models first, then export
 quantized deployment artifacts. This keeps training quality and deployment
 constraints separate.
 
-Observed examples from the 20260617T221121Z run:
+Observed 20260707 4xA100 ladder result:
 
-| Variant | Profile behavior | Outcome |
-| --- | --- | --- |
-| Qwen 2.5 Coder 7B, initial | 8,192 sequence length, per-device batch size 2 | Failed with CUDA OOM. |
-| Qwen 2.5 Coder 7B, safe | 4,096 sequence length, per-device batch size 1, gradient accumulation 2 | Completed in about 1,253 seconds. |
-| Devstral 24B | 8,192 sequence length, per-device batch size 1, gradient accumulation 2, FSDP | Completed in about 10,846 seconds. |
+| Candidate | Result |
+| --- | --- |
+| 32k, `all-raw`/`all-filtered`, FSDP/ZeRO-3 | Failed short GPU probes. |
+| 24k, `all-raw`/`all-filtered`, FSDP/ZeRO-3 | Failed short GPU probes. |
+| 16k, `all-raw`/`all-filtered`, FSDP/ZeRO-3 | Failed short GPU probes. |
+| 12k, `all-raw`, FSDP | Passed probe, selected, completed full training. |
+
+The selected variant was
+`tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707`.
+It used `mixed` XML/UDT targets, raw source context, and fixture sidecars.
 
 The training output is a PEFT adapter plus tokenizer/config metadata. Metrics
 and logs remain in the run directory for later benchmarking and export.
 
 ### 4. Generation
 
-Generation accepts command help text, optional source code, model/provider
-settings, and prompt shaping limits. The provider returns Galaxy XML, which is
-written to disk and validated immediately.
+Generation accepts command help text, optional source code, optional test/example
+sidecars, model/provider settings, and prompt shaping limits. The provider
+returns Galaxy XML, which is written to disk and validated immediately. Suite
+generation can emit multiple primary tool XML files plus sidecars such as
+`macros.xml`, datatype scaffolds, tool data table files, `.loc.sample` files,
+and `.shed.yml`.
 
 Generation records include:
 
@@ -156,17 +186,17 @@ a poor default.
 helpers write a Modelfile and can optionally register the model with the local
 Ollama runtime.
 
-Observed exports:
+Current observed export:
 
-| Variant | Quantizations | Ollama name |
+| Variant | GGUF artifacts | Ollama name |
 | --- | --- | --- |
-| `tools-iuc-qwen25-7b-full-20260617T221121Z-safe` | `q4_k_m` | `gtsm-tools-iuc-qwen25-7b-q4` |
-| `tools-iuc-devstral-24b-full-20260617T221121Z` | `q8_0`, `q6_k`, `q5_k_m`, `q4_k_m` | `gtsm-tools-iuc-devstral-24b-q4` |
+| `tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707` | bf16 plus `q4_k_m` | `gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-3f8e387314` |
 
-The Devstral export notes record that an automated wrapper hit UTF-8 decode
-handling while capturing `llama.cpp` output; the requested GGUF quantizations
-were completed manually with `llama-quantize`. That incident motivated explicit
-UTF-8 handling and stricter Ollama/GGUF path validation.
+The first 20260707 finalization attempt produced the GGUF artifacts but failed
+the `ollama create` registration because the external export environment did
+not have `ollama` on `PATH`. The registration was rerun with the Ollama binary
+available. This is why the run's `full-training.tsv` can show
+`post-export-failed` while the exported GGUF files themselves are valid.
 
 ### 8. Server and distributed operation
 

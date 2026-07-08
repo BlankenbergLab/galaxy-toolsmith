@@ -126,6 +126,75 @@ training environment. The runner skips inline `gtsm train` post-export flags,
 then calls `scripts/gtsm_llama_cpp_gguf.sh export` and `finalize` from the
 external environment after full training succeeds.
 
+## Observed 4xA100 Sidecar Run
+
+The current full-length example is
+`devstral-sidecars-fixtures-20260707`, run on 4 NVIDIA A100 40GB GPUs with
+1,985 IUC corpus records. It trained Devstral 24B on mixed XML/UDT targets with
+expanded XML, raw source context, command help, and upstream test/example
+fixtures as separate sidecar context.
+
+The launch shape was:
+
+```bash
+RUN_TAG=devstral-sidecars-fixtures-20260707 \
+PROFILE=agentic-devstral-24b \
+ARTIFACT_FORMAT=mixed \
+SOURCE_MODES=all-raw,all-filtered \
+SOURCE_MODE_PREFERENCE=all-raw,all-filtered \
+TEST_CONTEXT_MODE=fixtures \
+TEST_CONTEXT_MAX_CHARS=4000 \
+TEST_CONTEXT_MAX_FILES=6 \
+TEST_CONTEXT_MAX_FILE_BYTES=64KB \
+CONTEXT_LADDER=32k,24k,16k,12k,8k,4k,2k \
+DISTRIBUTED_STRATEGIES=fsdp,deepspeed-zero3 \
+GPU_DEVICES=0,1,2,3 \
+NUM_PROCESSES=4 \
+POST_EXPORT_ENV_DIR=.conda/gtsm-unsloth-export \
+POST_EXPORT_QUANTIZATIONS=q4_k_m \
+POST_OLLAMA_CREATE=1 \
+scripts/gtsm_context_ladder_train.sh launch
+```
+
+The ladder probes failed at 32k, 24k, and 16k for both `all-raw` and
+`all-filtered` source modes under both FSDP and DeepSpeed ZeRO-3. The selected
+candidate was:
+
+| Setting | Value |
+| --- | --- |
+| Context length | `12288` |
+| Source mode | `all-raw` |
+| Source budget | `24000` chars, `96` files |
+| Test sidecar mode | `fixtures` |
+| Distributed strategy | `fsdp` |
+| Processes | `4` |
+| Variant id | `tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707` |
+
+The full training run reached `training-finished` and recorded `completed` in
+the training status stream. External export produced a bf16 GGUF and a
+`q4_k_m` quantization:
+
+```text
+.gtsm-cache/models/exports/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707/gguf/
+.gtsm-cache/models/exports/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707/gguf/q4_k_m/
+```
+
+The first post-export run recorded `post-export-failed` because `ollama create`
+could not find `ollama` on `PATH` inside the separate export environment. The
+GGUF export and quantization were present; registration was rerun after pointing
+at the Ollama binary, producing the normalized model name
+`gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-3f8e387314`.
+
+Use these run-local files when auditing or resuming:
+
+```text
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/summary.md
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/probes.tsv
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/full-training.tsv
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/selection.env
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/minibwa-tests/comparison.md
+```
+
 ## Outputs
 
 Run outputs are written under:

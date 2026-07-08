@@ -146,7 +146,150 @@ printf "%s\n" "$GTSM_SERVER_AUTH_TOKEN" > .gtsm-cache/server.tokens
 chmod 600 .gtsm-cache/server.tokens
 ```
 
-## 4. Start the coordinator server (token-protected)
+## 4. Run the observed local context ladder
+
+The strongest documented run on this host is
+`devstral-sidecars-fixtures-20260707`. It used the local, single-node path: four
+GPU processes over the same training job, with model state sharded across the
+GPUs by FSDP/ZeRO-style distributed training. This is different from running
+four independent full models, one per GPU; sharding lets a larger model and
+longer context fit than any single A100 40GB card could handle alone.
+
+```bash
+RUN_TAG=devstral-sidecars-fixtures-20260707 \
+PROFILE=agentic-devstral-24b \
+ARTIFACT_FORMAT=mixed \
+SOURCE_MODES=all-raw,all-filtered \
+SOURCE_MODE_PREFERENCE=all-raw,all-filtered \
+TEST_CONTEXT_MODE=fixtures \
+TEST_CONTEXT_MAX_CHARS=4000 \
+TEST_CONTEXT_MAX_FILES=6 \
+TEST_CONTEXT_MAX_FILE_BYTES=64KB \
+CONTEXT_LADDER=32k,24k,16k,12k,8k,4k,2k \
+DISTRIBUTED_STRATEGIES=fsdp,deepspeed-zero3 \
+GPU_DEVICES=0,1,2,3 \
+NUM_PROCESSES=4 \
+POST_EXPORT_ENV_DIR=.conda/gtsm-unsloth-export \
+POST_EXPORT_QUANTIZATIONS=q4_k_m \
+POST_OLLAMA_CREATE=1 \
+scripts/gtsm_context_ladder_train.sh launch
+```
+
+Monitor the detached run:
+
+```bash
+RUN_TAG=devstral-sidecars-fixtures-20260707 scripts/gtsm_context_ladder_train.sh status
+RUN_TAG=devstral-sidecars-fixtures-20260707 scripts/gtsm_context_ladder_train.sh tail
+```
+
+The run writes audit files under:
+
+```text
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/
+```
+
+Important files are `summary.md`, `probes.tsv`, `full-training.tsv`,
+`selection.env`, and `logs/`.
+
+## 5. What the 20260707 run selected
+
+The ladder tried 32k, 24k, 16k, 12k, 8k, 4k, and 2k. It tested both raw and
+filtered source-context modes, and both FSDP and DeepSpeed ZeRO-3. The higher
+contexts failed during short GPU probes, so the selected setting was:
+
+| Setting | Value |
+| --- | --- |
+| Context length | `12288` |
+| Source context | `all-raw` |
+| Source budget | `24000` chars, `96` files |
+| Test/example sidecars | `fixtures`, capped at `4000` chars and `6` files |
+| Distributed strategy | `fsdp` |
+| GPU processes | `4` |
+| Variant id | `tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707` |
+
+The 12k setting is not a model limit; it is the highest setting this run proved
+stable for this corpus, sidecar budget, batch shape, and 4xA100 40GB machine.
+Increasing context raises memory roughly with attention and activation cost,
+while increasing source/test sidecar budgets raises prompt length pressure. The
+runner keeps falling back so an unattended run can still produce a model when
+larger contexts OOM.
+
+## 6. What context is used for fine-tuning
+
+The training samples combine the primary target artifact with sidecar context:
+
+| Context | How it is used |
+| --- | --- |
+| Galaxy wrapper XML | Primary supervised target for `xml` examples. |
+| Expanded XML | Macro-expanded wrapper view produced through Galaxy's tool loader. |
+| UDT YAML | Additional target form for `mixed` examples when convertible/synthesized UDT exists. |
+| Command metadata/help | Requirement-derived command names plus help collected from containers. |
+| Upstream source | Real source downloaded from Bioconda or conda-forge recipe sources, including archives and git sources. |
+| Helper/configfile code | Existing wrapper-local scripts and configfile templates, used as context for understanding legacy wrappers. |
+| Tests/examples/fixtures | Optional sidecar context controlled by `TEST_CONTEXT_*`, not part of the primary output. |
+| Shed metadata | Repository/suite metadata, used for Tool Shed packaging context. |
+
+During generation, macros, tool data tables, datatype scaffold files, and
+`.shed.yml` are sidecars. The primary model output remains a Galaxy `<tool>`
+unless suite generation is explicitly requested.
+
+## 7. Export and Ollama packaging
+
+The run used an external export environment because GGUF/Unsloth/llama.cpp
+dependencies can conflict with the main training environment:
+
+```bash
+POST_EXPORT_ENV_DIR=.conda/gtsm-unsloth-export
+```
+
+The full model export produced:
+
+```text
+.gtsm-cache/models/exports/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707/gguf/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707.bf16.gguf
+.gtsm-cache/models/exports/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707/gguf/q4_k_m/tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-devstral-sidecars-fixtures-20260707-q4_k_m.gguf
+```
+
+The first post-export status recorded `post-export-failed` because `ollama
+create` was not on `PATH` inside the export environment. The GGUF files were
+valid; rerunning registration with the Ollama binary available created:
+
+```text
+gtsm-tools-iuc-devstral-24b-mixed-all-raw-12288-fsdp-3f8e387314
+```
+
+Ollama packaging writes a Modelfile that points at a GGUF artifact and registers
+that file under a local Ollama model name. It does not retrain the model.
+
+## 8. Minibwa generation comparison
+
+After training and q4 export, the run compared four minibwa suite-generation
+paths under:
+
+```text
+.gtsm-cache/runs/context-ladder/devstral-sidecars-fixtures-20260707/minibwa-tests/
+```
+
+| Scenario | Exit | Records | XML tools | Repairs | Unknown datatypes | Params | Outputs | Tests | Citations | Help chars | Command chars |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Full local PEFT, Bioconda discovery | 0 | 11 | 11 | 0 | 8 | 87 | 13 | 11 | 11 | 14485 | 1517 |
+| Full local PEFT, static help/source | 0 | 11 | 11 | 0 | 8 | 61 | 11 | 11 | 11 | 7656 | 1223 |
+| Ollama q4, Bioconda discovery | 0 | 11 | 11 | 0 | 7 | 129 | 13 | 11 | 9 | 608 | 4684 |
+| Ollama q4, static help/source | 0 | 11 | 11 | 0 | 7 | 129 | 13 | 11 | 9 | 608 | 4721 |
+
+The full local PEFT model with Bioconda discovery was the best qualitative
+result: it had richer discovered help/source context, stronger command shapes,
+and complete Toolsmith citations. The q4 Ollama model generated structurally
+valid XML, but it was more verbose and speculative, had shorter final help
+sections, and produced fewer citations. These checks were structural generation
+comparisons, not Planemo execution.
+
+## 9. Client/server architecture mode
+
+The local context ladder is the recommended path for single-host long-context
+training. Galaxy Toolsmith also supports a client/server mode when jobs,
+workers, and monitoring need to be separated.
+
+Start a token-protected coordinator:
 
 ```bash
 gtsm serve \
@@ -160,14 +303,7 @@ gtsm serve \
   --detach-log .gtsm-cache/logs/server.detach.log
 ```
 
-`--status-log` is optional and disabled by default. Without it, status updates go to console only.
-`--detach` is optional and disabled by default. When enabled, the process continues after disconnect.
-
-## 5. Submit training job and start worker pool
-
-### Submit job
-
-Use non-quantized profile first (Devstral default):
+Submit a training job:
 
 ```bash
 gtsm train-remote-submit \
@@ -177,169 +313,38 @@ gtsm train-remote-submit \
   --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl
 ```
 
-For an opt-in full-parameter run on this class of host, use a `full-*` profile
-or override the method and learning rate explicitly:
-
-```bash
-gtsm train \
-  --profile full-mistral-24b \
-  --training-method full \
-  --learning-rate 2e-5 \
-  --backend axolotl \
-  --num-processes 4 \
-  --distributed-strategy auto \
-  --no-pad-to-sequence-len \
-  --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl
-```
-
-### Start workers
-
-Open separate shells (or managed services) and run:
+Run workers from separate shells or service units:
 
 ```bash
 export GTSM_SERVER_AUTH_TOKEN="$(cat .gtsm-cache/server.tokens)"
-CUDA_VISIBLE_DEVICES=0 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu0.status.jsonl --detach --detach-log .gtsm-cache/logs/worker-gpu0.detach.log
-CUDA_VISIBLE_DEVICES=1 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu1.status.jsonl --detach --detach-log .gtsm-cache/logs/worker-gpu1.detach.log
-CUDA_VISIBLE_DEVICES=2 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu2.status.jsonl --detach --detach-log .gtsm-cache/logs/worker-gpu2.detach.log
-CUDA_VISIBLE_DEVICES=3 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu3.status.jsonl --detach --detach-log .gtsm-cache/logs/worker-gpu3.detach.log
+CUDA_VISIBLE_DEVICES=0 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu0.status.jsonl
+CUDA_VISIBLE_DEVICES=1 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu1.status.jsonl
+CUDA_VISIBLE_DEVICES=2 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu2.status.jsonl
+CUDA_VISIBLE_DEVICES=3 gtsm train-worker --server-url http://127.0.0.1:8765 --status-log .gtsm-cache/logs/worker-gpu3.status.jsonl
 ```
 
-Check job status:
-
-```bash
-gtsm train-remote-status --server-url http://127.0.0.1:8765 --job-id <job-id> --status-log .gtsm-cache/logs/train-status.jsonl
-```
-
-Watch progress in browser (auto-refresh dashboard):
+The server exposes a browser monitor at:
 
 ```text
 http://127.0.0.1:8765/monitor
 ```
 
-If auth is enabled, provide bearer token in the dashboard token field, or open with query token:
+## 10. Model guidance on this host class
 
-```text
-http://127.0.0.1:8765/monitor?token=<token>
-```
+Use `agentic-devstral-24b` when the goal is a high-capability local wrapper
+model and the host has 4xA100 40GB available. Use smaller 7B/14B profiles for
+fast iteration or when fewer GPUs are available. Keep the non-quantized-first
+policy: train the full/PEFT model first, then export GGUF quantizations for
+deployment runtimes such as Ollama.
 
-Browser monitoring and JSONL status logs can be used together.
+With only 2 A100 40GB GPUs, use the same tooling but expect a lower selected
+context, slower probes, and more value from 7B/14B iteration runs. The ladder is
+designed to record the failures and fall back rather than silently changing the
+training shape.
 
-Fetch artifacts in parallel:
+## 11. Promotion gate before changing defaults
 
-```bash
-gtsm train-artifacts-fetch \
-  --server-url http://127.0.0.1:8765 \
-  --job-id <job-id> \
-  --output-dir .gtsm-cache/models/remote-artifacts \
-  --max-workers 8
-```
-
-## 6. Non-quantized-first tuning policy
-
-Recommended flow:
-
-1. Train with non-quantized profile (`quantization: none`)
-2. Export quantized variants for deployment/runtime targets
-
-Example quantized export:
-
-```bash
-gtsm export-model \
-  --variant-id <variant-id> \
-  --format all \
-  --quantizations q8_0,q6_k,q5_k_m,q4_k_m
-```
-
-Optional Ollama packaging:
-
-```bash
-gtsm export-ollama-model --variant-id <variant-id> --model-name gtsm-wrapper-model
-# optional:
-gtsm export-ollama-model --variant-id <variant-id> --model-name gtsm-wrapper-model --create
-```
-
-## 7. Which model is strongest here?
-
-### Current practical guidance
-
-- **Default non-quantized starting point (recommended):**
-  - `agentic-devstral-24b`
-- **Alternative fast-iteration options:**
-  - `proto-qwen25-7b`
-  - `deepseek-coder-v2-lite-instruct`
-- **Stronger but heavier (advanced/experimental):**
-  - `deepseek-r1-distill-qwen-14b`
-  - `deepseek-r1-distill-qwen-32b`
-  - `baseline-mistral-24b`
-
-Because tuning stability and throughput depend on sequence length, batch sizing, and runtime path, treat 32B as an advanced tier and benchmark against 14B/24B before adopting as your default.
-
-## 8. What changes if only 2 GPUs are used?
-
-Use the same flow, but:
-
-- run 2 workers instead of 4,
-- prefer 14B/24B tiers first,
-- lower concurrency and expect slower throughput,
-- keep non-quantized-first policy, then export quantized outputs.
-
-## 9. Can the server run as a daemon?
-
-Yes.
-
-### Option A (recommended): systemd
-
-Example unit (`/etc/systemd/system/gtsm-server.service`):
-
-```ini
-[Unit]
-Description=Galaxy Toolsmith Coordinator Server
-After=network.target
-
-[Service]
-Type=simple
-User=<your-user>
-WorkingDirectory=<repo-root>
-Environment=PYTHONPATH=<repo-root>/src
-Environment=GTSM_SERVER_AUTH_TOKEN_FILE=<repo-root>/.gtsm-cache/server.tokens
-ExecStart=/bin/bash -lc 'TOKENS_FILE=.gtsm-cache/server.tokens gtsm serve --host 0.0.0.0 --port 8765 --provider local --auth-tokens-file .gtsm-cache/server.tokens --require-generate-auth'
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now gtsm-server
-sudo systemctl status gtsm-server
-```
-
-### Option B: nohup/tmux
-
-```bash
-nohup gtsm serve --host 0.0.0.0 --port 8765 --provider local --auth-tokens-file .gtsm-cache/server.tokens --require-generate-auth > .gtsm-cache/server.log 2>&1 &
-```
-
-## 10. Is there an interactive setup process?
-
-Currently: no dedicated wizard command.
-
-Practical options now:
-
-- use this runbook as a copy/paste setup flow,
-- create a local setup script that writes tokens/env and starts server/workers.
-
-Future enhancement candidate:
-
-- `gtsm setup-wizard` to interactively generate env/config/token and startup commands.
-
-## 11. Promotion gate before changing primary default model
-
-Use benchmark + promotion checks before switching default profile:
+Use benchmark and promotion checks before changing a default model:
 
 ```bash
 gtsm benchmark-generate --corpus-jsonl .gtsm-cache/datasets/tools-iuc-corpus.jsonl --limit 50 --model-variant baseline

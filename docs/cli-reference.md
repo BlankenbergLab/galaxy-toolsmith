@@ -557,6 +557,10 @@ dependency-split systems, the context ladder can instead use
 Modelfile generation from a separate packaging environment after training
 succeeds.
 
+For the complete 4xA100 Devstral sidecar command used in the current observed
+run, see [A100 Pipeline Example](example.md) and
+[Context Ladder Training](context-ladder-training.md).
+
 Distributed strategies have different memory and throughput tradeoffs:
 
 | Strategy | Behavior |

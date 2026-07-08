@@ -107,6 +107,14 @@ known, launch with explicit devices and disable only the idle preflight:
 `launch` prefers `tmux` when available so the run survives shell cleanup; set
 `LAUNCH_BACKEND=nohup` to force the simpler fallback.
 
+The current 4xA100 documented example is
+`devstral-sidecars-fixtures-20260707`: Devstral 24B, mixed XML/UDT targets,
+`all-raw` source context, upstream test/example fixture sidecars, 12k selected
+context, FSDP across 4 A100 40GB GPUs, bf16 plus `q4_k_m` GGUF export, and a
+minibwa suite-generation comparison between full local PEFT and q4 Ollama. See
+`docs/example.md`, `docs/context-ladder-training.md`, and
+`docs/experiments.md` for the commands and results.
+
 The Linux conda environment includes `apptainer`, `squashfuse`, and `libfuse3`.
 `apptainer` provides the Singularity-compatible container runtime, `squashfuse`
 mounts cached SIF images directly, and `libfuse3` provides the env-local
@@ -302,7 +310,7 @@ gtsm train-artifacts-fetch --server-url http://127.0.0.1:8765 --job-id <job-id> 
   - `python -m mkdocs build --strict`
   - `python -m mkdocs serve -a 127.0.0.1:8000`
 - Production docs deployment uses Cloudflare Workers static assets configured in `wrangler.jsonc`.
-- Full 4xA100 pipeline runbook: `docs/example.md`
+- Full 4xA100 sidecar pipeline runbook and current comparison: `docs/example.md`
 
 ## Acknowledgements
 
