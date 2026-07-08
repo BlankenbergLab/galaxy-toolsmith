@@ -28,4 +28,4 @@ def render_prompt_template(task: str, context: dict[str, Any], skills_profile: s
             )
         raw = fallback.read_text(encoding="utf-8")
     template = Template(raw, undefined=StrictUndefined)
-    return template.render(**context).strip()
+    return str(template.render(**context)).strip()
